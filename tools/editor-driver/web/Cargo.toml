@@ -1,5 +1,5 @@
 [package]
-name = "web-editor-driver"
+name = "editor-driver-web"
 description = "Drives the Graphite web editor the way a person does, with real mouse and keyboard input, for scripts, QA, and agents"
 version.workspace = true
 license.workspace = true
@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-graphite-editor-control-protocol = { workspace = true }
+editor-driver-protocol = { workspace = true }
 
 # Workspace dependencies
 serde = { workspace = true }

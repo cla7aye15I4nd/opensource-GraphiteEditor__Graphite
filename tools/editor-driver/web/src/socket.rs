@@ -8,7 +8,7 @@ const MAX_MESSAGE_LENGTH: u64 = 16 * 1024 * 1024;
 
 /// The name of the local socket a session's host listens on, which is unique to the session.
 pub fn name(session_id: &str) -> Result<Name<'static>, String> {
-	let file_name = format!("graphite-web-editor-driver-{session_id}.sock");
+	let file_name = format!("graphite-editor-driver-web-{session_id}.sock");
 	let name = if GenericNamespaced::is_supported() {
 		file_name.to_ns_name::<GenericNamespaced>()
 	} else {

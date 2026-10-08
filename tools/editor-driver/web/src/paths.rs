@@ -9,7 +9,7 @@ pub fn tool_directory() -> PathBuf {
 }
 
 pub fn frontend_directory() -> PathBuf {
-	tool_directory().join("..").join("..").join("frontend")
+	tool_directory().join("..").join("..").join("..").join("frontend")
 }
 
 pub fn playwright_directory() -> PathBuf {

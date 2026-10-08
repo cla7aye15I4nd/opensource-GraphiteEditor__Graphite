@@ -8,7 +8,7 @@ Drives the Graphite web editor the way a person does. Every action is real mouse
 
 The driver runs its own copy of Chromium, downloaded into this directory, with a fresh profile every session. It never touches a browser, profile, or history already on the machine.
 
-It is written in Rust, apart from the small Node.js process in `playwright/` that delivers input and takes screenshots through Playwright. The commands, their results, and scenario files are defined by the editor control protocol in `editor/control-protocol`.
+It is written in Rust, apart from the small Node.js process in `playwright/` that delivers input and takes screenshots through Playwright. The commands, their results, and scenario files are defined by the editor driver protocol in `tools/editor-driver/protocol`.
 
 The TypeScript in `playwright/` follows the frontend's lint rules, using the tools the frontend installs. Check it with `npm run check` in that folder, and fix what can be fixed automatically with `npm run fix`.
 
@@ -66,7 +66,7 @@ A scenario file holds the same commands the command line performs, one per line 
 
 Scenario files are named for what they do, ending in `.jsonl`, such as `draw-rectangle.jsonl`.
 
-The commands and their fields are defined by `Command` in `editor/control-protocol/src/lib.rs`.
+The commands and their fields are defined by `Command` in `tools/editor-driver/protocol/src/lib.rs`.
 
 ## QA
 
@@ -84,7 +84,7 @@ Given a folder, `run` performs each `.jsonl` scenario file in it in a new sessio
 
 ```sh
 cargo run drive serve --port 8090
-cargo run drive run tools/web-editor-driver/scenarios
+cargo run drive run tools/editor-driver/web/scenarios
 ```
 
 The scenarios in `scenarios/` assume a page of 1600 by 1000 pixels, which their first step sets, since the values they expect depend on the zoom that size gives a new document.

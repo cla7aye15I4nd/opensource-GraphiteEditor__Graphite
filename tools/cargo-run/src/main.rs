@@ -91,7 +91,7 @@ fn drive(task: &Task) -> ExitCode {
 	}
 
 	// Run from the caller's own folder, which relative paths in the arguments are written from
-	let driver = cmd!("cargo", "run", "--quiet", "--package", "web-editor-driver", "--").args(&task.args).unchecked();
+	let driver = cmd!("cargo", "run", "--quiet", "--package", "editor-driver-web", "--").args(&task.args).unchecked();
 	match Expression::run(&driver) {
 		Ok(output) => ExitCode::from(output.status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(1)),
 		Err(e) => {

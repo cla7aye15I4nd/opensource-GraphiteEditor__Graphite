@@ -11,8 +11,8 @@ mod session;
 mod socket;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use editor_driver_protocol::{Command, Filmstrip, MouseButton, Rectangle, Space, parse_scenario};
 use glam::{DVec2, UVec2};
-use graphite_editor_control_protocol::{Command, Filmstrip, MouseButton, Rectangle, Space, parse_scenario};
 use serde::Serialize;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -849,7 +849,7 @@ mod tests {
 
 	#[test]
 	fn scenario_images_go_in_the_given_output_folder() {
-		let scenario = std::env::temp_dir().join(format!("web-editor-driver-test-{}.jsonl", std::process::id()));
+		let scenario = std::env::temp_dir().join(format!("editor-driver-web-test-{}.jsonl", std::process::id()));
 		let steps = [
 			r#"{ "type": "screenshot", "path": "shot.png" }"#,
 			r#"{ "type": "drag", "from": [0, 0], "to": [10, 10], "filmstrip": { "path": "strip.png" } }"#,

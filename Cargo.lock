@@ -1400,6 +1400,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "glam 0.33.10",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "editor-driver-web"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "clap",
+ "editor-driver-protocol",
+ "getrandom 0.3.3",
+ "glam 0.33.10",
+ "image",
+ "interprocess",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "editor-message-tree"
 version = "0.0.0"
 dependencies = [
@@ -2424,15 +2449,6 @@ dependencies = [
  "web-sys",
  "wgpu-executor",
  "zip",
-]
-
-[[package]]
-name = "graphite-editor-control-protocol"
-version = "0.0.0"
-dependencies = [
- "glam 0.33.10",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -6903,22 +6919,6 @@ dependencies = [
  "log",
  "once_cell",
  "pkg-config",
-]
-
-[[package]]
-name = "web-editor-driver"
-version = "0.0.0"
-dependencies = [
- "base64",
- "clap",
- "getrandom 0.3.3",
- "glam 0.33.10",
- "graphite-editor-control-protocol",
- "image",
- "interprocess",
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
