@@ -9,7 +9,8 @@
 # - Configures mold as the default linker for faster builds
 #
 # Usage:
-# - Development shell: `nix develop` from the project root
+# - Development shell: `nix develop` from the project root, or `nix develop .#full` with every feature
+# - A shell with chosen features from other Nix code: `devShells.<system>.custom.override { desktop = true; playwright = true; }`
 # - Run in dev shell with direnv: add `use flake` to .envrc
 {
   inputs = {

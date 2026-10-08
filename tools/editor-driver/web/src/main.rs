@@ -33,7 +33,7 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum CliCommand {
-	/// Download the driver's own isolated browser and the Playwright package that drives it.
+	/// Install the Playwright package that drives the browser, and download the driver's own isolated browser unless PLAYWRIGHT_BROWSERS_PATH provides one.
 	Install,
 
 	/// Serve the editor with the Vite dev server, building its Wasm first when run through `cargo run drive`.
@@ -719,13 +719,18 @@ fn install() -> Result<(), String> {
 		"Failed to install Playwright",
 	)?;
 
+	if let Some(provided) = paths::provided_browsers_directory() {
+		println!("Using the browsers already installed at {}", provided.display());
+		return Ok(());
+	}
+
 	// The full browser runs headless too, so the lighter headless shell is left out
 	let playwright = directory.join("node_modules").join("playwright-core").join("cli.js");
 	run_program(
 		std::process::Command::new("node")
 			.arg(playwright)
 			.args(["install", "--no-shell", "chromium"])
-			.env("PLAYWRIGHT_BROWSERS_PATH", paths::browsers_directory()),
+			.env(paths::BROWSERS_PATH_VARIABLE, paths::browsers_directory()),
 		"The browser failed to download",
 	)
 }

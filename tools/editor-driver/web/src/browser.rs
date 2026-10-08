@@ -1,6 +1,6 @@
 use base64::Engine;
-use glam::{DVec2, UVec2};
 use editor_driver_protocol::{MouseButton, Rectangle};
+use glam::{DVec2, UVec2};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -129,7 +129,7 @@ impl Browser {
 
 		let mut process = Command::new("node")
 			.arg(script)
-			.env("PLAYWRIGHT_BROWSERS_PATH", paths::browsers_directory())
+			.env(paths::BROWSERS_PATH_VARIABLE, paths::browsers_directory())
 			.current_dir(paths::playwright_directory())
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
