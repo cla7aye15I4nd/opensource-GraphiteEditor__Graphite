@@ -39,7 +39,7 @@ fn blur<T>(
 }
 
 /// Casts a soft shadow of the input graphics' silhouette beneath them.
-#[node_macro::node(category("Raster: Effect"), icon("NodeDropShadow"))]
+#[node_macro::node(category("Raster: Effect"), icon("NodeDropShadow"), version(2))]
 fn drop_shadow<T>(
 	_: impl Ctx,
 	/// The content casting the shadow.
@@ -48,6 +48,9 @@ fn drop_shadow<T>(
 	/// The shadow's color, with its opacity.
 	#[default("#000000bf")]
 	color: Item<Color>,
+	/// How the shadow mixes with the colors beneath it.
+	#[default(BlendMode::Multiply)]
+	blend_mode: Item<BlendMode>,
 	/// The direction the light comes from, which the shadow falls away from.
 	#[unit("°")]
 	#[range]
@@ -82,6 +85,7 @@ fn drop_shadow<T>(
 		&mut content,
 		Effect::new(&EffectOperation::DropShadow {
 			color: evaluate_color_effects(color).into_element(),
+			blend_mode: *blend_mode.element(),
 			angle: *angle.element(),
 			distance: *distance.element(),
 			spread: *spread.element(),
@@ -94,7 +98,7 @@ fn drop_shadow<T>(
 }
 
 /// Casts a soft shadow inward from the edges of the input graphics, as if they were cut out of the surface.
-#[node_macro::node(category("Raster: Effect"), icon("NodeInnerShadow"))]
+#[node_macro::node(category("Raster: Effect"), icon("NodeInnerShadow"), version(2))]
 fn inner_shadow<T>(
 	_: impl Ctx,
 	/// The content the shadow falls inside.
@@ -103,6 +107,9 @@ fn inner_shadow<T>(
 	/// The shadow's color, with its opacity.
 	#[default("#000000bf")]
 	color: Item<Color>,
+	/// How the shadow mixes with the content's colors, and with what shows through where the content is faded.
+	#[default(BlendMode::Multiply)]
+	blend_mode: Item<BlendMode>,
 	/// The direction the light comes from, which the edges facing it cast the shadow away from.
 	#[unit("°")]
 	#[range]
@@ -134,6 +141,7 @@ fn inner_shadow<T>(
 		&mut content,
 		Effect::new(&EffectOperation::InnerShadow {
 			color: evaluate_color_effects(color).into_element(),
+			blend_mode: *blend_mode.element(),
 			angle: *angle.element(),
 			distance: *distance.element(),
 			choke: *choke.element(),
@@ -144,7 +152,7 @@ fn inner_shadow<T>(
 	content
 }
 
-/// A glow's color or gradient paint with its own effects carried out.
+/// A glow's, outline's, or bevel texture's paint with its own effects carried out, if it's a color or gradient.
 fn glow_paint(paint: Item<Graphic>) -> Graphic {
 	match paint_with_envelope_effects(paint) {
 		Graphic::Color(color) => Graphic::Color(evaluate_color_effects(color)),
@@ -156,7 +164,7 @@ fn glow_paint(paint: Item<Graphic>) -> Graphic {
 }
 
 /// Surrounds the input graphics with a soft glow of their silhouette.
-#[node_macro::node(category("Raster: Effect"), icon("NodeOuterGlow"))]
+#[node_macro::node(category("Raster: Effect"), icon("NodeOuterGlow"), version(2))]
 fn outer_glow<T>(
 	_: impl Ctx,
 	/// The content to glow around.
@@ -165,6 +173,9 @@ fn outer_glow<T>(
 	/// The glow's color with its opacity, or a gradient that runs from the content's edge outward across the glow.
 	#[default("#ffffbebf")]
 	color: Item<Graphic>,
+	/// How the glow mixes with the colors beneath it.
+	#[default(BlendMode::Screen)]
+	blend_mode: Item<BlendMode>,
 	/// Whether the glow fades like a blur or evenly with the distance from the content.
 	technique: Item<GlowTechnique>,
 	/// How much of the size hardens the glow by growing its edge outward, rather than softening it.
@@ -193,6 +204,7 @@ fn outer_glow<T>(
 		&mut content,
 		Effect::new(&EffectOperation::OuterGlow {
 			color: glow_paint(color),
+			blend_mode: *blend_mode.element(),
 			technique: *technique.element(),
 			spread: *spread.element(),
 			size: *size.element(),
@@ -204,7 +216,7 @@ fn outer_glow<T>(
 }
 
 /// Glows inward from the edges of the input graphics, or outward from their center.
-#[node_macro::node(category("Raster: Effect"), icon("NodeInnerGlow"))]
+#[node_macro::node(category("Raster: Effect"), icon("NodeInnerGlow"), version(2))]
 fn inner_glow<T>(
 	_: impl Ctx,
 	/// The content to glow within.
@@ -213,6 +225,9 @@ fn inner_glow<T>(
 	/// The glow's color with its opacity, or a gradient that runs from the content's edges inward (or from its center outward) across the glow.
 	#[default("#ffffbebf")]
 	color: Item<Graphic>,
+	/// How the glow mixes with the content's colors, and with what shows through where the content is faded.
+	#[default(BlendMode::Screen)]
+	blend_mode: Item<BlendMode>,
 	/// Whether the glow fades like a blur or evenly with the distance from the content's edges.
 	technique: Item<GlowTechnique>,
 	/// Whether the glow starts from the edges or the center.
@@ -243,6 +258,7 @@ fn inner_glow<T>(
 		&mut content,
 		Effect::new(&EffectOperation::InnerGlow {
 			color: glow_paint(color),
+			blend_mode: *blend_mode.element(),
 			technique: *technique.element(),
 			source: *source.element(),
 			choke: *choke.element(),
@@ -255,7 +271,7 @@ fn inner_glow<T>(
 }
 
 /// Shades the inside of the input graphics with soft, glossy bands that follow their shape.
-#[node_macro::node(category("Raster: Effect"), icon("NodeSatin"))]
+#[node_macro::node(category("Raster: Effect"), icon("NodeSatin"), version(2))]
 fn satin<T>(
 	_: impl Ctx,
 	/// The content to shade.
@@ -264,6 +280,9 @@ fn satin<T>(
 	/// The shading's color, with its opacity.
 	#[default("#00000080")]
 	color: Item<Color>,
+	/// How the shading mixes with the content's colors, and with what shows through where the content is faded.
+	#[default(BlendMode::Multiply)]
+	blend_mode: Item<BlendMode>,
 	/// The direction the two casts of the content's silhouette are moved along, one each way, which the bands run across.
 	#[unit("°")]
 	#[range]
@@ -293,6 +312,7 @@ fn satin<T>(
 		&mut content,
 		Effect::new(&EffectOperation::Satin {
 			color: evaluate_color_effects(color).into_element(),
+			blend_mode: *blend_mode.element(),
 			angle: *angle.element(),
 			distance: *distance.element(),
 			size: *size.element(),
@@ -303,16 +323,18 @@ fn satin<T>(
 	content
 }
 
-/// Draws a band of color along the edge of the input graphics, outside, inside, or centered on it.
-#[node_macro::node(category("Raster: Effect"), icon("NodeOutline"))]
+/// Paints a band along the edge of the input graphics, outside, inside, or centered on it.
+#[node_macro::node(category("Raster: Effect"), icon("NodeOutline"), version(3))]
 fn outline<T>(
 	_: impl Ctx,
 	/// The content to outline.
 	#[implementations(Graphic, Vector, Raster<CPU>, Raster<GPU>, Color, Gradient, String, Generator)]
 	content: Item<T>,
-	/// The outline's color, with its opacity.
+	/// The color, gradient, image, or other graphic to paint the outline with. A gradient or image without its own placement stretches across the content and its outline.
 	#[default(Color::BLACK)]
-	color: Item<Color>,
+	paint: Item<Graphic>,
+	/// How the outline mixes with the colors beneath it, or with the content's colors inside its edge.
+	blend_mode: Item<BlendMode>,
 	/// How thick the outline is.
 	#[unit(" px")]
 	#[range]
@@ -323,21 +345,26 @@ fn outline<T>(
 	/// Whether the outline is drawn outside the edge, inside it, or centered on it.
 	#[default(StrokeAlign::Outside)]
 	align: Item<StrokeAlign>,
+	/// Runs a gradient paint across the outline's width, from its outer edge to its inner edge, rather than by the gradient's own placement.
+	contour_gradient: Item<bool>,
 ) -> Item<T> {
+	// Stamped even with no paint, which draws nothing, so whether the content has effects doesn't depend on a value
 	let mut content = content;
 	stamp_effect(
 		&mut content,
 		Effect::new(&EffectOperation::Outline {
-			color: evaluate_color_effects(color).into_element(),
+			paint: glow_paint(paint),
+			blend_mode: *blend_mode.element(),
 			weight: *weight.element(),
 			align: *align.element(),
+			contour_gradient: *contour_gradient.element(),
 		}),
 	);
 	content
 }
 
 /// Raises the input graphics into a lit relief, with highlights on the slopes facing the light and shadows on those facing away.
-#[node_macro::node(name("Bevel & Emboss"), category("Raster: Effect"), icon("NodeBevelAndEmboss"))]
+#[node_macro::node(name("Bevel & Emboss"), category("Raster: Effect"), icon("NodeBevelAndEmboss"), version(2))]
 fn bevel_and_emboss<T>(
 	_: impl Ctx,
 	/// The content to raise.
@@ -370,6 +397,7 @@ fn bevel_and_emboss<T>(
 	#[soft(..16)]
 	soften: Item<f64>,
 	/// The direction the light comes from.
+	#[widget(ParsedWidgetOverride::Custom = "wrapping_range_slider")]
 	#[unit("°")]
 	#[range]
 	#[soft(-180..180)]
@@ -384,15 +412,37 @@ fn bevel_and_emboss<T>(
 	/// The highlight's color, with its opacity.
 	#[default("#ffffffbf")]
 	highlight_color: Item<Color>,
-	/// How the highlight mixes with the content's colors.
+	/// How the highlight mixes with the colors beneath it.
 	#[default(BlendMode::Screen)]
 	highlight_blend_mode: Item<BlendMode>,
 	/// The shadow's color, with its opacity.
 	#[default("#000000bf")]
 	shadow_color: Item<Color>,
-	/// How the shadow mixes with the content's colors.
+	/// How the shadow mixes with the colors beneath it.
 	#[default(BlendMode::Multiply)]
 	shadow_blend_mode: Item<BlendMode>,
+	/// A graphic with lightness that sinks the surface into a relief, like a pattern pressed into it. A gradient or image without its own placement stretches across the content.
+	texture: Item<Graphic>,
+	/// How deep the texture's lightest parts sink, as a share of the slope's width, or how high they rise when negative.
+	#[unit("%")]
+	#[range]
+	#[soft(-1000..1000)]
+	#[default(100.)]
+	texture_depth: Item<f64>,
+	/// How much of the slope the slope contour spans: down from the top of an inner bevel, or up from the foot of an outer one. An emboss's always spans its whole slope. At 100%, a straight one leaves the slope as it is.
+	#[unit("%")]
+	#[range]
+	#[hard(1..100)]
+	#[default(100.)]
+	slope_range: Item<f64>,
+	/// Samples the gloss contour across each pixel, smoothing its steep parts.
+	gloss_antialiased: Item<bool>,
+	/// Samples the slope contour across each pixel, smoothing its steep parts.
+	slope_antialiased: Item<bool>,
+	/// Reshapes how lit the slope is, from where it faces away from the light to where it faces it, for glossy or metallic sheens.
+	gloss_contour: Item<TransferCurve>,
+	/// Reshapes the slope's profile, for ridges, grooves, and rounded or stepped edges.
+	slope_contour: Item<TransferCurve>,
 ) -> Item<T> {
 	let mut content = content;
 	stamp_effect(
@@ -410,6 +460,13 @@ fn bevel_and_emboss<T>(
 			highlight_blend_mode: *highlight_blend_mode.element(),
 			shadow_color: evaluate_color_effects(shadow_color).into_element(),
 			shadow_blend_mode: *shadow_blend_mode.element(),
+			texture: glow_paint(texture),
+			texture_depth: *texture_depth.element(),
+			slope_range: *slope_range.element(),
+			gloss_antialiased: *gloss_antialiased.element(),
+			slope_antialiased: *slope_antialiased.element(),
+			gloss_contour: gloss_contour.into_element(),
+			slope_contour: slope_contour.into_element(),
 		}),
 	);
 	content
@@ -425,7 +482,7 @@ fn paint_overlay<T>(
 	/// The color, gradient, image, or other graphic to paint with. A gradient or image without its own placement stretches across the content.
 	#[default(Color::BLACK)]
 	paint: Item<Graphic>,
-	/// How the paint mixes with the content's colors.
+	/// How the paint mixes with the content's colors, and with what shows through where the content is faded.
 	blend_mode: Item<BlendMode>,
 	/// How strongly the paint shows.
 	#[unit("%")]
@@ -480,8 +537,9 @@ mod test {
 		);
 		let result = raster_kernels::evaluate_raster_effects(result).into_element();
 
-		// Multiplying by green keeps only the green channel, and the content keeps its own alpha
-		assert_eq!(result.data[0], Color::from_rgbaf32_unchecked(0., image_color.g(), 0., image_color.a()));
+		// Multiplying by green keeps only the green channel. It blends within the content's share, so the translucent content keeps its own alpha.
+		let expected = Color::from_rgbaf32_unchecked(0., image_color.g(), 0., image_color.a());
+		assert!((result.data[0].to_vec4() - expected.to_vec4()).abs().max_element() < 1e-4, "{:?} against {expected:?}", result.data[0]);
 	}
 
 	#[test]

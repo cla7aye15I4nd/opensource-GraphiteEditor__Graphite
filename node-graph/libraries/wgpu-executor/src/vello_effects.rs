@@ -5,13 +5,18 @@ use bytemuck::{Pod, Zeroable};
 use core_types::Color;
 use core_types::blending::BlendMode;
 use core_types::transfer_curve::TransferCurve;
-use glam::{DMat2, DVec2, DVec3, UVec2};
-use graphic_types::effects::{EffectCapture, GRADIENT_GLOW_FADE, GlowFill, bevel_light, grow_and_tent, outline_extents, shadow_offset};
+use glam::{DMat2, DVec2, UVec2};
+use graphic_types::effect_layers::{EffectLayers, EffectPiece, LayerPart, PiecePlace, is_pixel_filter};
+use graphic_types::effects::{EffectCapture, GRADIENT_GLOW_FADE, GRADIENT_TABLE_SIZE, GlowFill, OutlineFill, bevel_light, contour_gradient_span, grow_and_tent, outline_extents, shadow_offset};
+use graphic_types::masks::mask_feather_sigma;
 use graphic_types::{Adjustment, BevelDirection, BevelStyle, BevelTechnique, EffectOperation, Effects, GlowSource, GlowTechnique};
 use raster_kernels::effect_kernels::{BlurKernel, MAX_KERNEL_REACH, NEGLIGIBLE_LENGTH, chamfer_passes};
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use wgpu::util::DeviceExt;
+
+mod masks;
+mod styles;
 
 /// The format of the images the passes produce, with the precision to keep soft gradients smooth.
 pub(crate) const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -21,8 +26,8 @@ const COVERAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
 /// How many samples of a contour the shaders interpolate between, enough to follow its spline to well within a level.
 const CONTOUR_SAMPLES: u32 = 256;
-/// How many samples of a glow's gradient the shaders interpolate between.
-const GRADIENT_SAMPLES: u32 = 256;
+/// How many samples of a glow's or outline's gradient the shaders read.
+const GRADIENT_SAMPLES: u32 = GRADIENT_TABLE_SIZE as u32;
 
 /// The most taps one kernel pass weighs, matching the length of the shader's array, which holds a kernel of [`MAX_KERNEL_REACH`] texels to each side in pairs.
 const MAX_TAPS: usize = 1 + 2 * MAX_KERNEL_REACH.div_ceil(2);
@@ -123,7 +128,11 @@ impl EffectPasses {
 			log::warn!("This GPU can't render into the formats layer effects need, so content draws without its effects");
 		}
 
-		let shader = device.create_shader_module(wgpu::include_wgsl!("vello_effects.wgsl"));
+		// The styles' and masks' passes live in files of their own, sharing this one's bindings and helpers
+		let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+			label: Some("vello_effects.wgsl"),
+			source: wgpu::ShaderSource::Wgsl(concat!(include_str!("vello_effects.wgsl"), include_str!("vello_styles.wgsl"), include_str!("vello_masks.wgsl")).into()),
+		});
 
 		let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
 			binding,
@@ -195,10 +204,10 @@ impl EffectPasses {
 			.clone()
 	}
 
-	/// Carries out `effects` on `content`, a texture of premultiplied pixels, returning the result in a pooled texture of [`WORKING_FORMAT`] the same size.
-	/// `lengths_to_pixels` maps the effects' lengths onto the texture's pixels, and `fill` fades the content but not the shadows and glows cast from it.
-	/// `paints` holds the paint overlays' paints that aren't solid colors, in order, each rendered over the same pixels as the content.
-	/// With a `capture`, the result is instead that effect's coverage, as black with it in alpha, and the effects after it are left out.
+	/// Carries out `effects` on `content`, a texture of premultiplied pixels, returning each of the `layers` they draw in a pooled texture of [`WORKING_FORMAT`] the same size, with the mode it blends by.
+	/// `lengths_to_pixels` maps the effects' lengths onto the texture's pixels, `fill` fades the content but not the shadows and glows cast from it, and `opacity` fades the layers.
+	/// `paints` holds the effects' drawn paints in order, each rendered over the same pixels as the content.
+	/// With a `capture`, the only result is instead that effect's coverage, as black with it in alpha, or the share [`EffectCapture::THROUGH_MASK`] names.
 	#[expect(clippy::too_many_arguments)]
 	pub(crate) fn apply(
 		&self,
@@ -207,11 +216,13 @@ impl EffectPasses {
 		textures: &mut EffectTextures,
 		content: &wgpu::Texture,
 		effects: &Effects,
+		layers: &EffectLayers,
 		fill: f32,
+		opacity: f32,
 		lengths_to_pixels: DMat2,
 		paints: &[wgpu::Texture],
 		capture: Option<EffectCapture>,
-	) -> wgpu::Texture {
+	) -> Vec<(wgpu::Texture, BlendMode)> {
 		let mut recorder = PassRecorder {
 			passes: self,
 			device,
@@ -228,14 +239,28 @@ impl EffectPasses {
 		let mut filled = (fill < 1.).then(|| recorder.scale(content, fill));
 		// The shadows and glows stacked beneath the content
 		let mut beneath: Option<wgpu::Texture> = None;
+		// The layered effects' pieces, each tinted
+		let mut pieces: HashMap<EffectCapture, wgpu::Texture> = HashMap::new();
+		// How much the trailing masks together show of each finished layer
+		let mut layer_fade: Option<wgpu::Texture> = None;
+
+		// A captured coverage ends the passes in place of the effects' result, once the content's layer is finished if its knockout or share depends on that
+		let mut captured: Option<wgpu::Texture> = None;
+		let captured_piece = capture.and_then(|capture| layers.piece(capture)).map(|(_, piece)| piece);
+		// At a full fill, the content's own layer has exactly the full-strength content's alpha, so knocking out a piece within it again changes nothing
+		let knocks_out_by_layer = |piece: &EffectPiece| piece.knocks_out && (fill < 1. || layers.knockout_cover(piece.capture, opacity) < 1. || layers.masks_fade_knockout_cover(piece.capture));
+		let capture_needs_content_layer = capture == Some(EffectCapture::THROUGH_MASK) || captured_piece.as_ref().is_some_and(knocks_out_by_layer);
 
 		// Each operation with its index, for a capture to name, leaving out those that change nothing so they don't split the runs of adjustments around them
 		let operations: Vec<(usize, EffectOperation)> = effects.operations().enumerate().filter(|(_, operation)| !changes_nothing(operation, length_scale)).collect();
 		let mut paints = paints.iter();
 		for (position, (index, operation)) in operations.iter().enumerate() {
 			let index = *index;
-			// A captured coverage ends the passes in place of the effects' result
-			let mut captured = None;
+			// A layered effect's coverages become pieces, which the content knocks out once its layer is finished, and a flattened one is knocked out by the faded content now
+			let layered = index >= layers.flattened;
+			let piece = |plane: usize| EffectCapture { index, plane };
+			let knockout_fill = if layered { 1. } else { fill };
+
 			// A coverage is captured in black, and an already tinted image as it is
 			let mut capture_plane = |recorder: &mut PassRecorder, plane: usize, coverage: &wgpu::Texture, tinted: bool| {
 				if capture == Some(EffectCapture { index, plane }) {
@@ -269,17 +294,16 @@ impl EffectPasses {
 					size,
 					ref contour,
 					knockout,
+					..
 				} => {
 					let full_content = full.as_ref().unwrap_or(content);
 					let silhouette = recorder.silhouette(full_content, lengths_to_pixels * shadow_offset(angle, distance), false);
 					let mut strength = recorder.cast(silhouette, size, spread, GlowTechnique::Softer, 100., contour, length_scale);
 					if knockout {
-						strength = recorder.knock_out(strength, full_content, fill);
+						strength = recorder.knock_out(strength, full_content, knockout_fill);
 					}
 					capture_plane(&mut recorder, 0, &strength, false);
-
-					beneath = Some(recorder.accumulate(beneath, &strength, color));
-					recorder.textures.release(strength);
+					recorder.place_beneath(layered.then_some((&mut pieces, piece(0))), &mut beneath, strength, Some(color));
 				}
 				EffectOperation::OuterGlow {
 					ref color,
@@ -288,6 +312,7 @@ impl EffectPasses {
 					size,
 					range,
 					ref contour,
+					..
 				} => {
 					let Some(paint) = GlowFill::of(color) else { continue };
 					let full_content = full.as_ref().unwrap_or(content);
@@ -306,13 +331,13 @@ impl EffectPasses {
 					};
 					[Some(raw), shaped].into_iter().flatten().for_each(|texture| recorder.textures.release(texture));
 
-					let coverage = recorder.knock_out(coverage, full_content, fill);
+					let coverage = recorder.knock_out(coverage, full_content, knockout_fill);
 					capture_plane(&mut recorder, 0, &coverage, color.is_none());
-					beneath = Some(recorder.stack_beneath(beneath, &coverage, color));
-					recorder.textures.release(coverage);
+					recorder.place_beneath(layered.then_some((&mut pieces, piece(0))), &mut beneath, coverage, color);
 				}
 				EffectOperation::InnerShadow {
 					color,
+					blend_mode,
 					angle,
 					distance,
 					choke,
@@ -323,10 +348,11 @@ impl EffectPasses {
 					let outside = recorder.silhouette(full_content, lengths_to_pixels * shadow_offset(angle, distance), true);
 					let strength = recorder.cast(outside, size, choke, GlowTechnique::Softer, 100., contour, length_scale);
 					capture_plane(&mut recorder, 0, &strength, false);
-					recorder.shade_within(content, &mut full, &mut filled, strength, Some(color));
+					recorder.place_within(layered.then_some((&mut pieces, piece(0))), content, &mut full, &mut filled, strength, Some(color), blend_mode);
 				}
 				EffectOperation::InnerGlow {
 					ref color,
+					blend_mode,
 					technique,
 					source,
 					choke,
@@ -345,22 +371,24 @@ impl EffectPasses {
 					}
 
 					// A gradient paints each pixel its own color, which a map captures whole, and doesn't fade since the content bounds it
+					let destination = layered.then_some((&mut pieces, piece(0)));
 					match paint {
 						GlowFill::Solid(color) => {
 							capture_plane(&mut recorder, 0, &strength, false);
-							recorder.shade_within(content, &mut full, &mut filled, strength, Some(color));
+							recorder.place_within(destination, content, &mut full, &mut filled, strength, Some(color), blend_mode);
 						}
 						GlowFill::Gradient { .. } => {
 							let tinted = recorder.gradient_glow_tint(&paint, &strength, &strength, false);
 							recorder.textures.release(strength);
 							let Some(tinted) = tinted else { continue };
 							capture_plane(&mut recorder, 0, &tinted, true);
-							recorder.shade_within(content, &mut full, &mut filled, tinted, None);
+							recorder.place_within(destination, content, &mut full, &mut filled, tinted, None, blend_mode);
 						}
 					}
 				}
 				EffectOperation::Satin {
 					color,
+					blend_mode,
 					angle,
 					distance,
 					size,
@@ -385,26 +413,59 @@ impl EffectPasses {
 
 					let strength = recorder.shape(difference, 100., contour);
 					capture_plane(&mut recorder, 0, &strength, false);
-					recorder.shade_within(content, &mut full, &mut filled, strength, Some(color));
+					recorder.place_within(layered.then_some((&mut pieces, piece(0))), content, &mut full, &mut filled, strength, Some(color), blend_mode);
 				}
-				EffectOperation::Outline { color, weight, align } => {
-					// The band outside lies beneath the content like a shadow, and the band inside over it like an inner shadow
+				EffectOperation::Outline {
+					ref paint,
+					blend_mode,
+					weight,
+					align,
+					contour_gradient,
+				} => {
+					let Some(outline_fill) = OutlineFill::of(paint, contour_gradient) else { continue };
+					let drawn_paint = match outline_fill {
+						OutlineFill::Drawn(_) => match paints.next() {
+							Some(paint) => Some(paint),
+							None => continue,
+						},
+						_ => None,
+					};
+
 					let (outside, inside) = outline_extents(weight * length_scale, align);
-					if outside >= NEGLIGIBLE_LENGTH {
-						let full_content = full.as_ref().unwrap_or(content);
-						let silhouette = recorder.silhouette(full_content, DVec2::ZERO, false);
-						let band = recorder.grown(silhouette, outside);
-						let band = recorder.knock_out(band, full_content, fill);
+					let contour_span = matches!(outline_fill, OutlineFill::ContourGradient(_))
+						.then(|| contour_gradient_span(weight, align))
+						.map(|(start, span)| (start * length_scale, span * length_scale));
+					let bands = recorder.outline_bands(full.as_ref().unwrap_or(content), outside, inside, contour_span);
+					if let Some(positions) = &bands.positions {
+						capture_plane(&mut recorder, 2, positions, false);
+					}
+
+					// A solid color tints each band as it's composited, and other paints color it beforehand
+					let color = match outline_fill {
+						OutlineFill::Solid(color) => Some(color),
+						_ => None,
+					};
+					let painted = |recorder: &mut PassRecorder, band: wgpu::Texture| match (&outline_fill, drawn_paint, &bands.positions) {
+						(OutlineFill::Drawn(_), Some(paint), _) => recorder.paint_band(band, paint),
+						(OutlineFill::ContourGradient(gradient), _, Some(positions)) => recorder.contour_gradient_band(band, positions, gradient),
+						_ => band,
+					};
+
+					// The band outside lies beneath the content like a shadow, and the band inside over it like an inner shadow
+					if let Some(band) = bands.outside {
+						let band = recorder.knock_out(band, full.as_ref().unwrap_or(content), knockout_fill);
 						capture_plane(&mut recorder, 0, &band, false);
 
-						beneath = Some(recorder.accumulate(beneath, &band, color));
-						recorder.textures.release(band);
+						let band = painted(&mut recorder, band);
+						recorder.place_beneath(layered.then_some((&mut pieces, piece(0))), &mut beneath, band, color);
 					}
-					if inside >= NEGLIGIBLE_LENGTH {
-						let outside_content = recorder.silhouette(full.as_ref().unwrap_or(content), DVec2::ZERO, true);
-						let band = recorder.grown(outside_content, inside);
+					if let Some(band) = bands.inside {
 						capture_plane(&mut recorder, 1, &band, false);
-						recorder.shade_within(content, &mut full, &mut filled, band, Some(color));
+						let band = painted(&mut recorder, band);
+						recorder.place_within(layered.then_some((&mut pieces, piece(1))), content, &mut full, &mut filled, band, color, blend_mode);
+					}
+					if let Some(positions) = bands.positions {
+						recorder.textures.release(positions);
 					}
 				}
 				EffectOperation::BevelAndEmboss {
@@ -420,21 +481,52 @@ impl EffectPasses {
 					highlight_blend_mode,
 					shadow_color,
 					shadow_blend_mode,
+					ref gloss_contour,
+					gloss_antialiased,
+					ref slope_contour,
+					slope_antialiased,
+					slope_range,
+					texture_depth,
+					..
 				} => {
+					let texture = match operation.drawn_paint() {
+						Some(_) => match paints.next() {
+							Some(texture) => Some(texture),
+							None => continue,
+						},
+						None => None,
+					};
 					let size = size * length_scale;
-					if size < NEGLIGIBLE_LENGTH {
+					if size < NEGLIGIBLE_LENGTH && gloss_contour.is_identity() {
 						continue;
 					}
 
-					// The surface's height, lit from the light's direction into its highlights and shadows
-					let silhouette = recorder.silhouette(full.as_ref().unwrap_or(content), DVec2::ZERO, false);
-					let (height, rise) = recorder.bevel_height(silhouette, style, technique, size);
+					// The surface's height, reshaped by the contour and sunk by the texture, lit from the light's direction into its highlights and shadows
+					let (height, rise) = recorder.bevel_height(full.as_ref().unwrap_or(content), style, technique, size);
 					let rise = rise * depth / 100. * if direction == BevelDirection::Down { -1. } else { 1. };
+
+					// Under a gloss contour or texture, the shading beneath the content fades out across the slopes' foot
+					let fades_at_foot = !gloss_contour.is_identity() || texture.is_some();
+
+					let surface = styles::BevelSurface {
+						style,
+						slope_contour,
+						slope_range,
+						slope_antialiased,
+						texture,
+						texture_depth,
+					};
+					let gloss = (!gloss_contour.is_identity()).then(|| (recorder.contour_samples(gloss_contour), gloss_antialiased));
 					let light = bevel_light(angle, altitude, lengths_to_pixels);
 					let (_, soften) = grow_and_tent(soften * length_scale, 0.);
-					let lit = |recorder: &mut PassRecorder, rise: f64| {
+					// How much brighter the slopes are lit, needed only by a gloss contour or the fade at the foot, without which the highlight and shadow are lit directly
+					let lit = |recorder: &mut PassRecorder, rise: f64| (gloss.is_some() || fades_at_foot).then(|| recorder.bevel_lit(&height, &surface, rise, light, None));
+					let amounts = |recorder: &mut PassRecorder, brighter: Option<&wgpu::Texture>, rise: f64, fades_at_foot: bool| {
 						[false, true].map(|shadow| {
-							let amount = recorder.bevel_shading(&height, rise, light, shadow);
+							let amount = match brighter {
+								Some(brighter) => recorder.bevel_amount(brighter, &height, gloss.as_ref(), light.z, shadow, fades_at_foot),
+								None => recorder.bevel_lit(&height, &surface, rise, light, Some(shadow)),
+							};
 							match soften >= NEGLIGIBLE_LENGTH {
 								true => recorder.blur(amount, BlurKernel::Tent { radius: soften }, false),
 								false => amount,
@@ -443,54 +535,92 @@ impl EffectPasses {
 					};
 
 					// The slopes inside the content are lit over it, and those outside lie beneath it, mirrored for a pillow so they rise away from the edge
-					let inside = (style != BevelStyle::OuterBevel).then(|| lit(&mut recorder, rise));
+					let brighter = lit(&mut recorder, rise);
+					let inside = (style != BevelStyle::OuterBevel).then(|| amounts(&mut recorder, brighter.as_ref(), rise, false));
 					let colors = [(highlight_color, highlight_blend_mode), (shadow_color, shadow_blend_mode)];
 					if let Some(inside) = &inside {
 						for (plane, (amount, (color, blend_mode))) in inside.iter().zip(colors).enumerate() {
 							capture_plane(&mut recorder, plane, amount, false);
-							recorder.shade_within_by_mode(content, &mut full, &mut filled, amount, Some(color), blend_mode);
+							match layered {
+								true => {
+									let tinted = recorder.tinted(amount, color);
+									pieces.insert(piece(plane), tinted);
+								}
+								false => recorder.shade_within_by_mode(content, &mut full, &mut filled, amount, Some(color), blend_mode),
+							}
 						}
 					}
 					let outside = match style {
 						BevelStyle::InnerBevel => None,
-						BevelStyle::OuterBevel => Some(lit(&mut recorder, rise)),
-						BevelStyle::Emboss => inside,
+						BevelStyle::Emboss if !fades_at_foot => inside,
+						BevelStyle::OuterBevel | BevelStyle::Emboss => {
+							inside.into_iter().flatten().for_each(|amount| recorder.textures.release(amount));
+							Some(amounts(&mut recorder, brighter.as_ref(), rise, fades_at_foot))
+						}
 						BevelStyle::PillowEmboss => {
 							inside.into_iter().flatten().for_each(|amount| recorder.textures.release(amount));
-							Some(lit(&mut recorder, -rise))
+							let mirrored = lit(&mut recorder, -rise);
+							let outside = amounts(&mut recorder, mirrored.as_ref(), -rise, fades_at_foot);
+							mirrored.into_iter().for_each(|mirrored| recorder.textures.release(mirrored));
+							Some(outside)
 						}
 					};
+					brighter.into_iter().for_each(|brighter| recorder.textures.release(brighter));
 					for (plane, (amount, (color, _))) in outside.into_iter().flatten().zip(colors).enumerate() {
-						let amount = recorder.knock_out(amount, full.as_ref().unwrap_or(content), fill);
+						let amount = recorder.knock_out(amount, full.as_ref().unwrap_or(content), knockout_fill);
 						capture_plane(&mut recorder, plane + 2, &amount, false);
-						beneath = Some(recorder.accumulate(beneath, &amount, color));
-						recorder.textures.release(amount);
+						recorder.place_beneath(layered.then_some((&mut pieces, piece(plane + 2))), &mut beneath, amount, Some(color));
 					}
 					recorder.textures.release(height);
 				}
 				EffectOperation::PaintOverlay { blend_mode, opacity, .. } => {
 					let Some(paint) = paints.next() else { continue };
+					let painted = recorder.scale(paint, (opacity / 100.) as f32);
+					recorder.place_within(layered.then_some((&mut pieces, piece(0))), content, &mut full, &mut filled, painted, None, blend_mode);
+				}
+				// A solid paint overlay paints within the content alone, like any other paint overlay
+				EffectOperation::Adjustment(Adjustment::ColorOverlay { color, blend_mode, opacity }) => {
 					let parameters = Parameters {
-						amount: (opacity / 100.) as f32,
-						values: [blend_mode as u32 as f32, 0., 0., 0.],
+						color: premultiplied_gamma_channels(color.with_alpha(color.a() * (opacity / 100.) as f32)),
 						..Default::default()
 					};
+					let painted = recorder.run("flood", WORKING_FORMAT, recorder.size, full.as_ref().unwrap_or(content), None, None, parameters);
+					recorder.place_within(layered.then_some((&mut pieces, piece(0))), content, &mut full, &mut filled, painted, None, blend_mode);
+				}
+				EffectOperation::Mask { mode, density, feather, invert, .. } => {
+					let Some(mask) = paints.next() else { continue };
 
-					let overlaid = recorder.run("paint_overlay", WORKING_FORMAT, recorder.size, full.as_ref().unwrap_or(content), Some(paint), None, parameters);
-					recorder.replace_or_fill(&mut full, overlaid);
-					if let Some(filled) = &mut filled {
-						let overlaid = recorder.run("paint_overlay", WORKING_FORMAT, recorder.size, filled, Some(paint), None, parameters);
-						recorder.replace(filled, overlaid);
+					// SVG takes the strength as a map where the mask graphic's own effects need the GPU
+					let strength = recorder.mask_strength(mask, mode, density, mask_feather_sigma(feather) * length_scale, invert);
+					capture_plane(&mut recorder, 0, &strength, false);
+
+					if layers.trailing_masks.contains(&index) {
+						layer_fade = Some(recorder.faded_together(layer_fade.take(), strength));
+					} else {
+						recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
+						recorder.fade_by(content, &mut full, &mut filled, &strength);
+						recorder.textures.release(strength);
 					}
+				}
+				EffectOperation::Feather { distance } => {
+					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
+
+					let strength = recorder.feather_strength(full.as_ref().unwrap_or(content), distance * length_scale);
+					capture_plane(&mut recorder, 0, &strength, false);
+					recorder.fade_by(content, &mut full, &mut filled, &strength);
+					recorder.textures.release(strength);
 				}
 				EffectOperation::Adjustment(_) => {
 					// A run of adjustments is carried out from its first row, in a pass for each standalone step and one for the steps between them
-					if position > 0 && matches!(operations[position - 1].1, EffectOperation::Adjustment(_)) {
+					let is_adjustment = |position: usize| is_pixel_filter(&operations[position].1) && matches!(operations[position].1, EffectOperation::Adjustment(_));
+					if position > 0 && is_adjustment(position - 1) {
 						continue;
 					}
-					let run: Vec<&Adjustment> = operations[position..]
-						.iter()
-						.map_while(|(_, operation)| match operation {
+
+					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
+					let run: Vec<&Adjustment> = (position..operations.len())
+						.take_while(|&position| is_adjustment(position))
+						.filter_map(|position| match &operations[position].1 {
 							EffectOperation::Adjustment(adjustment) => Some(adjustment),
 							_ => None,
 						})
@@ -499,7 +629,6 @@ impl EffectPasses {
 					// The content at full strength is read only by an operation after the run, or shown as the result where no fill fades it
 					let full_is_read = filled.is_none() || position + run.len() < operations.len();
 
-					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
 					let prepared_passes = recorder.textures.prepare_adjustments(device, queue, &run);
 
 					// Each pass but the last hands its result on in the chained format, so splitting the run rounds nothing
@@ -523,38 +652,167 @@ impl EffectPasses {
 				}
 			}
 
-			if let Some(captured) = captured {
-				[full, filled, beneath].into_iter().flatten().for_each(|texture| recorder.textures.release(texture));
-				queue.submit([recorder.encoder.finish()]);
-				return captured;
+			if captured.is_some() && !capture_needs_content_layer {
+				break;
 			}
+		}
+		if let Some(captured) = captured.take_if(|_| !capture_needs_content_layer) {
+			let textures = [full, filled, beneath, layer_fade].into_iter().flatten().chain(pieces.into_values());
+			textures.for_each(|texture| recorder.textures.release(texture));
+			queue.submit([recorder.encoder.finish()]);
+			return vec![(captured, BlendMode::Normal)];
 		}
 
 		// A coverage the passes never reached, like that of a band too thin to draw at this resolution, covers nothing
-		if capture.is_some() {
+		if capture.is_some_and(|capture| capture != EffectCapture::THROUGH_MASK) && captured.is_none() {
 			let empty = recorder.scale(full.as_ref().unwrap_or(content), 0.);
-			[full, filled, beneath].into_iter().flatten().for_each(|texture| recorder.textures.release(texture));
+			let textures = [full, filled, beneath, layer_fade].into_iter().flatten().chain(pieces.into_values());
+			textures.for_each(|texture| recorder.textures.release(texture));
 			queue.submit([recorder.encoder.finish()]);
-			return empty;
+			return vec![(empty, BlendMode::Normal)];
 		}
 
-		let result = match (filled, beneath) {
-			(filled, Some(beneath)) => {
-				let result = recorder.composite_beneath(filled.as_ref().or(full.as_ref()).unwrap_or(content), &beneath);
-				[Some(beneath), full, filled].into_iter().flatten().for_each(|texture| recorder.textures.release(texture));
-				result
-			}
-			(Some(filled), None) => {
-				if let Some(full) = full {
-					recorder.textures.release(full);
-				}
-				filled
-			}
-			(None, None) => full.unwrap_or_else(|| recorder.scale(content, 1.)),
+		// The content's layer is finished first, since the knockouts and the parts showing through its fill read its alpha
+		let content_layer = layers.content_layer();
+		// The full-strength content becomes the content's image itself where no piece or capture reads it beside that image
+		let mut content_image = match filled {
+			Some(filled) => filled,
+			None if pieces.is_empty() && !capture_needs_content_layer => full.take().unwrap_or_else(|| recorder.scale(content, 1.)),
+			None => recorder.scale(full.as_ref().unwrap_or(content), 1.),
 		};
+		let full_content = full.as_ref().unwrap_or(content);
 
+		// The passes working from the opacity read the trailing masks' fade of it beside the content's alpha, flagged in `values.w`
+		let content_with_fade = layer_fade.as_ref().map(|fade| recorder.content_with_layer_fade(full_content, fade));
+		let (fading_content, fades) = match &content_with_fade {
+			Some(content_with_fade) => (content_with_fade, 1.),
+			None => (full_content, 0.),
+		};
+		let cover_fades = |capture: EffectCapture| if layers.masks_fade_knockout_cover(capture) { fades } else { 0. };
+
+		let content_parts = content_layer.into_iter().flat_map(|layer| &layers.layers[layer].parts);
+		for piece in content_parts.filter_map(|part| match part {
+			LayerPart::Piece(piece) => Some(piece),
+			LayerPart::Content => None,
+		}) {
+			let part = match piece.place {
+				PiecePlace::Within => 0.,
+				PiecePlace::IntoContent { over: false } => 1.,
+				PiecePlace::IntoContent { over: true } => 2.,
+				PiecePlace::Beneath | PiecePlace::Through { .. } => continue,
+			};
+			let Some(tinted) = pieces.get(&piece.capture) else { continue };
+			let parameters = Parameters {
+				amount: opacity,
+				values: [piece.blend_mode as u32 as f32, 1., part, fades],
+				..Default::default()
+			};
+			let composited = recorder.run("composite_within", WORKING_FORMAT, recorder.size, &content_image, Some(tinted), Some(fading_content), parameters);
+			recorder.replace(&mut content_image, composited);
+		}
+
+		// A capture that waited for the content's layer is a knocked-out coverage, or the share showing through the content's fill
+		if capture_needs_content_layer {
+			let output = match (captured, capture) {
+				(Some(captured), Some(capture)) => {
+					let parameters = Parameters {
+						amount: layers.knockout_cover(capture, opacity),
+						values: [0., 0., 0., cover_fades(capture)],
+						..Default::default()
+					};
+					let knocked_out = recorder.run("knock_out_by_layer", WORKING_FORMAT, recorder.size, &captured, Some(&content_image), Some(fading_content), parameters);
+					recorder.textures.release(captured);
+					knocked_out
+				}
+				(None, Some(EffectCapture::THROUGH_MASK)) => {
+					let parameters = Parameters {
+						amount: opacity,
+						values: [1., 0., 0., fades],
+						..Default::default()
+					};
+					recorder.run("through_mask", WORKING_FORMAT, recorder.size, full_content, Some(&content_image), Some(fading_content), parameters)
+				}
+				// A coverage too small to draw, like an outline's band at a far zoom, covers nothing
+				_ => recorder.run("flood", WORKING_FORMAT, recorder.size, full_content, None, None, Parameters::default()),
+			};
+			let textures = [full, Some(content_image), beneath, content_with_fade, layer_fade].into_iter().flatten().chain(pieces.into_values());
+			textures.for_each(|texture| recorder.textures.release(texture));
+			queue.submit([recorder.encoder.finish()]);
+			return vec![(output, BlendMode::Normal)];
+		}
+
+		// The content's image moves into its layer, copied only when a layer over it still reads its alpha
+		let reads_content_layer = |part: &LayerPart| {
+			matches!(
+				part,
+				LayerPart::Piece(
+					EffectPiece {
+						place: PiecePlace::Through { .. },
+						..
+					} | EffectPiece { knocks_out: true, .. }
+				)
+			)
+		};
+		let read_after = (layers.layers.iter().skip(content_layer.map_or(usize::MAX, |layer| layer + 1))).any(|layer| layer.parts.iter().any(reads_content_layer));
+
+		// Each layer stacks its parts in order: what lies beneath the content, then the content with what lies within it
+		let mut content_image = Some(content_image);
+		let mut results = Vec::new();
+		for (index, layer) in layers.layers.iter().enumerate() {
+			let holds_content = Some(index) == content_layer;
+			let mut stack = if holds_content { beneath.take() } else { None };
+
+			for part in &layer.parts {
+				let LayerPart::Piece(part_piece) = part else { continue };
+				// Only the knockouts and the parts through the fill read the content's layer, which is kept for them while a later layer holds one
+				let with_content_layer = || pieces.get(&part_piece.capture).zip(content_image.as_ref());
+				let upper = match part_piece.place {
+					PiecePlace::Beneath if !knocks_out_by_layer(part_piece) => pieces.remove(&part_piece.capture),
+					PiecePlace::Beneath => with_content_layer().map(|(tinted, content_image)| {
+						let parameters = Parameters {
+							amount: layers.knockout_cover(part_piece.capture, opacity),
+							values: [0., 0., 0., cover_fades(part_piece.capture)],
+							..Default::default()
+						};
+						recorder.run("knock_out_by_layer", WORKING_FORMAT, recorder.size, tinted, Some(content_image), Some(fading_content), parameters)
+					}),
+					PiecePlace::Within if !holds_content => {
+						(pieces.get(&part_piece.capture)).map(|tinted| recorder.run("mask_within", WORKING_FORMAT, recorder.size, tinted, None, Some(full_content), Parameters::default()))
+					}
+					PiecePlace::Through { .. } => with_content_layer().map(|(tinted, content_image)| {
+						let parameters = Parameters {
+							amount: opacity,
+							values: [0., 0., 0., fades],
+							..Default::default()
+						};
+						recorder.run("through_mask", WORKING_FORMAT, recorder.size, tinted, Some(content_image), Some(fading_content), parameters)
+					}),
+					PiecePlace::Within | PiecePlace::IntoContent { .. } => continue,
+				};
+				if let Some(upper) = upper {
+					stack = Some(recorder.stack_over(stack, upper));
+				}
+			}
+
+			let image = match (holds_content, read_after) {
+				(true, true) => content_image.as_ref().map(|image| recorder.scale(image, 1.)),
+				(true, false) => content_image.take(),
+				(false, _) => None,
+			};
+			let Some(mut result) = image.map(|image| recorder.stack_over(stack.take(), image)).or(stack) else {
+				continue;
+			};
+			if let Some(fade) = &layer_fade {
+				let faded = recorder.run("apply_mask", WORKING_FORMAT, recorder.size, &result, Some(fade), None, Parameters::default());
+				recorder.replace(&mut result, faded);
+			}
+			results.push((result, layer.blend_mode));
+		}
+
+		let textures = [full, content_image, beneath, content_with_fade, layer_fade].into_iter().flatten().chain(pieces.into_values());
+		textures.for_each(|texture| recorder.textures.release(texture));
 		queue.submit([recorder.encoder.finish()]);
-		result
+		results
 	}
 
 	/// Carries out a run of adjustments, in the passes `prepared` for it, on the top level of `image`, a texture of straight linear color if
@@ -717,17 +975,15 @@ fn draw_covering(encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgp
 	pass.draw(0..3, 0..1);
 }
 
-/// Whether an operation leaves the content as it is: a blur, bevel, or outline too slight to see, or a glow with nothing to paint.
+/// Whether an operation leaves the content as it is, by its settings alone or as a blur or bevel too slight to see at this scale.
 fn changes_nothing(operation: &EffectOperation, length_scale: f64) -> bool {
-	match operation {
-		EffectOperation::Blur { radius: length, .. } | EffectOperation::BevelAndEmboss { size: length, .. } => length * length_scale < NEGLIGIBLE_LENGTH,
-		EffectOperation::OuterGlow { color, .. } | EffectOperation::InnerGlow { color, .. } => GlowFill::of(color).is_none_or(|fill| fill.is_invisible()),
-		EffectOperation::Outline { color, weight, align } => {
-			let (outside, inside) = outline_extents(weight * length_scale, *align);
-			color.a() <= 0. || (outside < NEGLIGIBLE_LENGTH && inside < NEGLIGIBLE_LENGTH)
-		}
+	// Each drawn paint is matched to its operation by order, so only those without one are left out for their size here
+	let too_slight = match operation {
+		EffectOperation::Blur { radius, .. } => radius * length_scale < NEGLIGIBLE_LENGTH,
+		EffectOperation::BevelAndEmboss { size, gloss_contour, .. } => size * length_scale < NEGLIGIBLE_LENGTH && gloss_contour.is_identity(),
 		_ => false,
-	}
+	};
+	operation.changes_nothing() || (too_slight && operation.drawn_paint().is_none())
 }
 
 /// Which pixels seed a distance pass, and how far from each one its edge lies.
@@ -739,6 +995,8 @@ enum Seeds {
 	PastGrow { grow: f64 },
 	/// Every pixel, with its value as a head start, matching `distances_through_seeds` of values that are all finite.
 	Weighted,
+	/// Like `Covered`, but measured in straight lines rather than by `chamfer_length`.
+	CoveredStraight,
 }
 
 /// A color as the premultiplied, gamma-encoded channels the passes work with.
@@ -929,13 +1187,15 @@ impl PassRecorder<'_> {
 	/// Each pixel's distance from the `seeds` in `seed_values`, matching the CPU's distance passes, or far past `reach` pixels.
 	/// Jump flooding finds them in a pass for each halving of a step that starts past `reach`, then two more halvings and those of [`chamfer_passes`] along the chamfer steps. O(width × height × log(reach)).
 	fn distances(&mut self, seed_values: &wgpu::Texture, reach: f64, seeds: Seeds) -> wgpu::Texture {
-		let (mode, grow) = match seeds {
-			Seeds::Covered => (0., 0.),
-			Seeds::PastGrow { grow } => (1., grow as f32),
-			Seeds::Weighted => (2., 0.),
+		let (mode, grow, straight) = match seeds {
+			Seeds::Covered => (0., 0., 0.),
+			Seeds::PastGrow { grow } => (1., grow as f32, 0.),
+			Seeds::Weighted => (2., 0., 0.),
+			Seeds::CoveredStraight => (0., 0., 1.),
 		};
 		let parameters = |step: u32| Parameters {
 			values: [step as f32, mode, grow, 0.],
+			amount: straight,
 			..Default::default()
 		};
 
@@ -948,6 +1208,7 @@ impl PassRecorder<'_> {
 		}
 		let chamfer_parameters = Parameters {
 			values: [1., mode, grow, 1.],
+			amount: straight,
 			..Default::default()
 		};
 		for _ in 0..chamfer_passes(reach) {
@@ -1017,11 +1278,6 @@ impl PassRecorder<'_> {
 		knocked_out
 	}
 
-	/// Stacks a silhouette's coverage, tinted `color`, over what lies `beneath` the content so far.
-	fn accumulate(&mut self, beneath: Option<wgpu::Texture>, coverage: &wgpu::Texture, color: Color) -> wgpu::Texture {
-		self.stack_beneath(beneath, coverage, Some(color))
-	}
-
 	/// Stacks a coverage tinted `color`, or with no color an already tinted premultiplied image, over what lies `beneath` the content so far.
 	fn stack_beneath(&mut self, beneath: Option<wgpu::Texture>, coverage: &wgpu::Texture, color: Option<Color>) -> wgpu::Texture {
 		let parameters = Parameters {
@@ -1038,7 +1294,7 @@ impl PassRecorder<'_> {
 	}
 
 	/// Places what lies `beneath` under the full-strength content (`content` itself until a pass replaces it) and the faded fill,
-	/// so a pixel filter after it (a blur or an adjustment) processes them together.
+	/// so a pixel filter after it (a blur, an adjustment, a mask, or a feather) processes them together.
 	fn merge_beneath(&mut self, content: &wgpu::Texture, full: &mut Option<wgpu::Texture>, filled: &mut Option<wgpu::Texture>, beneath: Option<wgpu::Texture>) {
 		let Some(beneath) = beneath else { return };
 
@@ -1056,11 +1312,69 @@ impl PassRecorder<'_> {
 		self.run("composite_beneath", WORKING_FORMAT, self.size, image, Some(beneath), None, Parameters::default())
 	}
 
-	/// Places a silhouette's coverage, tinted `color` (or with no color, already tinted), over both the full-strength content (`content` itself
-	/// until a pass replaces it) and the faded fill, within the content, then frees the coverage.
-	fn shade_within(&mut self, content: &wgpu::Texture, full: &mut Option<wgpu::Texture>, filled: &mut Option<wgpu::Texture>, coverage: wgpu::Texture, color: Option<Color>) {
-		self.shade_within_by_mode(content, full, filled, &coverage, color, BlendMode::Normal);
+	/// A coverage tinted `color`.
+	fn tinted(&mut self, coverage: &wgpu::Texture, color: Color) -> wgpu::Texture {
+		let parameters = Parameters {
+			color: premultiplied_gamma_channels(color),
+			..Default::default()
+		};
+		self.run("tint", WORKING_FORMAT, self.size, coverage, None, None, parameters)
+	}
+
+	/// A coverage tinted `color`, freeing the coverage, or with no color the already tinted image itself.
+	fn tint_consuming(&mut self, coverage: wgpu::Texture, color: Option<Color>) -> wgpu::Texture {
+		let Some(color) = color else { return coverage };
+		let tinted = self.tinted(&coverage, color);
 		self.textures.release(coverage);
+		tinted
+	}
+
+	/// The `upper` image stacked over the `stack` if there is one, freeing both.
+	fn stack_over(&mut self, stack: Option<wgpu::Texture>, upper: wgpu::Texture) -> wgpu::Texture {
+		let Some(stack) = stack else { return upper };
+		let stacked = self.composite_beneath(&upper, &stack);
+		self.textures.release(upper);
+		self.textures.release(stack);
+		stacked
+	}
+
+	/// Places a coverage tinted `color` (or with no color, already tinted) beneath the content: as the piece `destination` names among the layered pieces, or else stacked beneath the content's image. Frees the coverage.
+	fn place_beneath(&mut self, destination: Option<(&mut HashMap<EffectCapture, wgpu::Texture>, EffectCapture)>, beneath: &mut Option<wgpu::Texture>, coverage: wgpu::Texture, color: Option<Color>) {
+		match destination {
+			Some((pieces, capture)) => {
+				let tinted = self.tint_consuming(coverage, color);
+				pieces.insert(capture, tinted);
+			}
+			None => {
+				*beneath = Some(self.stack_beneath(beneath.take(), &coverage, color));
+				self.textures.release(coverage);
+			}
+		}
+	}
+
+	/// Places a coverage tinted `color` (or with no color, already tinted) within the content: as the piece `destination` names among the layered pieces,
+	/// or else over the content's image, mixed with its colors by the blend mode. Frees the coverage.
+	#[expect(clippy::too_many_arguments)]
+	fn place_within(
+		&mut self,
+		destination: Option<(&mut HashMap<EffectCapture, wgpu::Texture>, EffectCapture)>,
+		content: &wgpu::Texture,
+		full: &mut Option<wgpu::Texture>,
+		filled: &mut Option<wgpu::Texture>,
+		coverage: wgpu::Texture,
+		color: Option<Color>,
+		blend_mode: BlendMode,
+	) {
+		match destination {
+			Some((pieces, capture)) => {
+				let tinted = self.tint_consuming(coverage, color);
+				pieces.insert(capture, tinted);
+			}
+			None => {
+				self.shade_within_by_mode(content, full, filled, &coverage, color, blend_mode);
+				self.textures.release(coverage);
+			}
+		}
 	}
 
 	/// Places a coverage over both the full-strength content (`content` itself until a pass replaces it) and the faded fill, within the content,
@@ -1088,17 +1402,28 @@ impl PassRecorder<'_> {
 		self.replace_or_fill(full, composited);
 	}
 
-	/// A bevel's height from 0 to 1 over the `style`'s slopes `size` pixels wide, shaped by the `technique`, with how many pixels a height of 1 rises, matching the CPU's `bevel_height`.
-	fn bevel_height(&mut self, silhouette: wgpu::Texture, style: BevelStyle, technique: BevelTechnique, size: f64) -> (wgpu::Texture, f64) {
+	/// A bevel's height over the `style`'s slopes `size` pixels wide, shaped by the `technique`, from -0.5 at their foot to 0.5 at their top, with how many pixels they rise.
+	/// It's cast from the `content`'s silhouette and centered on the edge, where half floats are finest. Matches the CPU's `bevel_height`.
+	fn bevel_height(&mut self, content: &wgpu::Texture, style: BevelStyle, technique: BevelTechnique, size: f64) -> (wgpu::Texture, f64) {
 		let span = match style {
 			BevelStyle::InnerBevel | BevelStyle::OuterBevel => size,
 			BevelStyle::Emboss | BevelStyle::PillowEmboss => size / 2.,
 		};
 
+		// Slopes too narrow to see leave a flat surface, of the coverage less a half, which only a gloss contour shades
+		if span < NEGLIGIBLE_LENGTH {
+			let parameters = Parameters { amount: 0.5, ..Default::default() };
+			return (self.run("cast_silhouette", COVERAGE_FORMAT, self.size, content, None, None, parameters), 0.);
+		}
+
+		// A smooth bevel blurs the coverage less a half, cast that way
 		if technique == BevelTechnique::Smooth {
 			let (_, tent) = grow_and_tent(span, 0.);
-			return (self.blur(silhouette, BlurKernel::Tent { radius: tent }, false), span);
+			let parameters = Parameters { amount: 0.5, ..Default::default() };
+			let centered = self.run("cast_silhouette", COVERAGE_FORMAT, self.size, content, None, None, parameters);
+			return (self.blur(centered, BlurKernel::Tent { radius: tent }, false), span);
 		}
+		let silhouette = self.silhouette(content, DVec2::ZERO, false);
 
 		// The height spans only the part across the edge the style lights
 		let near = if technique == BevelTechnique::ChiselSoft { 3. } else { 2. };
@@ -1133,23 +1458,12 @@ impl PassRecorder<'_> {
 		};
 
 		let parameters = Parameters {
-			values: [low as f32, high as f32, if technique == BevelTechnique::ChiselSoft { 1. } else { 0. }, 0.],
+			values: [low as f32, high as f32, if technique == BevelTechnique::ChiselSoft { 1. } else { 0. }, (span + 1.) as f32],
 			..Default::default()
 		};
 		let height = self.run("chisel_height", COVERAGE_FORMAT, self.size, &inward, Some(&outward), None, parameters);
 		[inward, outward, silhouette].into_iter().for_each(|texture| self.textures.release(texture));
-		(height, span / (2. * (span + 1.)) * (high - low))
-	}
-
-	/// How much each pixel of a bevel's surface is lit by the `light` past a flat surface's brightness, or if `shadow`, how much it falls short, matching the CPU's `bevel_shading`.
-	fn bevel_shading(&mut self, height: &wgpu::Texture, rise: f64, light: DVec3, shadow: bool) -> wgpu::Texture {
-		let light = light.as_vec3();
-		let parameters = Parameters {
-			amount: if shadow { 1. } else { 0. },
-			values: [light.x, light.y, light.z, rise as f32],
-			..Default::default()
-		};
-		self.run("bevel_shading", COVERAGE_FORMAT, self.size, height, None, None, parameters)
+		(height, span)
 	}
 
 	/// The image (of any format a shader can load from) with a pass of adjustments carried out on it into a texture of `format`, reading what was `prepared` for the pass,
@@ -1367,10 +1681,14 @@ mod tests {
 		let mut textures = EffectTextures::default();
 		let content = textures.acquire(&context.device, UVec2::splat(16), wgpu::TextureFormat::Rgba8Unorm);
 		let queue = context.queue.lock();
-		let draw = |textures: &mut EffectTextures| {
+		let apply = |textures: &mut EffectTextures, effects: &Effects| {
 			textures.drawn_passes.clear();
-			let result = passes.apply(&context.device, &queue, textures, &content, &effects, 1., DMat2::IDENTITY, &[], None);
-			textures.release(result);
+			let layers = EffectLayers::plan(effects, BlendMode::Normal, 1., false);
+			let results = passes.apply(&context.device, &queue, textures, &content, effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+			results.into_iter().for_each(|(result, _)| textures.release(result));
+		};
+		let draw = |textures: &mut EffectTextures| {
+			apply(textures, &effects);
 			textures.drawn_passes.iter().filter(|&&label| label == "adjust").count()
 		};
 
@@ -1386,18 +1704,10 @@ mod tests {
 		// A run reading the content first does so straight from the content's own format, without copying it beforehand
 		let mut drawn = |operations: Vec<EffectOperation>, fill| {
 			textures.drawn_passes.clear();
-			let result = passes.apply(
-				&context.device,
-				&queue,
-				&mut textures,
-				&content,
-				&Effects::from_operations(operations),
-				fill,
-				DMat2::IDENTITY,
-				&[],
-				None,
-			);
-			textures.release(result);
+			let effects = Effects::from_operations(operations);
+			let layers = EffectLayers::plan(&effects, BlendMode::Normal, fill, false);
+			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, fill, 1., DMat2::IDENTITY, &[], None);
+			results.into_iter().for_each(|(result, _)| textures.release(result));
 			textures.drawn_passes.clone()
 		};
 		let second_run: Vec<EffectOperation> = second_run.iter().cloned().map(EffectOperation::Adjustment).collect();
@@ -1407,6 +1717,7 @@ mod tests {
 		assert_eq!(drawn(second_run.clone(), 0.5), ["scale", "adjust"]);
 		let shadow = EffectOperation::DropShadow {
 			color: Color::BLACK,
+			blend_mode: BlendMode::Normal,
 			angle: 0.,
 			distance: 2.,
 			spread: 0.,
@@ -1420,6 +1731,52 @@ mod tests {
 		// Each standalone step takes a pass of its own, even beside another of its kind
 		let gradient_map = EffectOperation::Adjustment(first_run[2].clone());
 		assert_eq!(drawn(vec![gradient_map; 5], 1.), ["adjust"; 5]);
+	}
+
+	#[test]
+	fn effects_blending_normally_at_a_full_fill_take_no_more_passes_when_layered() {
+		use graphic_types::effects::EffectKind;
+
+		let Some(context) = futures::executor::block_on(crate::WgpuContext::for_tests()) else { return };
+		let passes = EffectPasses::new(&context.device, &context.adapter);
+		if !passes.renders_working_formats {
+			return;
+		}
+
+		let effects = Effects::from_operations([EffectOperation::default_for(EffectKind::DropShadow), EffectOperation::default_for(EffectKind::InnerShadow)]);
+		let mut textures = EffectTextures::default();
+		let content = textures.acquire(&context.device, UVec2::splat(16), wgpu::TextureFormat::Rgba8Unorm);
+		let queue = context.queue.lock();
+		let mut drawn = |layered: bool| {
+			textures.drawn_passes.clear();
+			let layers = EffectLayers::plan(&effects, BlendMode::Normal, 1., layered);
+			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+			results.into_iter().for_each(|(result, _)| textures.release(result));
+			textures.drawn_passes.clone()
+		};
+		assert_eq!(drawn(true), drawn(false));
+	}
+
+	#[test]
+	fn a_bevel_without_a_gloss_contour_or_texture_lights_its_highlight_and_shadow_directly() {
+		use graphic_types::effects::EffectKind;
+
+		let Some(context) = futures::executor::block_on(crate::WgpuContext::for_tests()) else { return };
+		let passes = EffectPasses::new(&context.device, &context.adapter);
+		if !passes.renders_working_formats {
+			return;
+		}
+
+		let effects = Effects::from_operations([EffectOperation::default_for(EffectKind::BevelAndEmboss)]);
+		let mut textures = EffectTextures::default();
+		let content = textures.acquire(&context.device, UVec2::splat(16), wgpu::TextureFormat::Rgba8Unorm);
+		let queue = context.queue.lock();
+		let layers = EffectLayers::plan(&effects, BlendMode::Normal, 1., false);
+		let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+		results.into_iter().for_each(|(result, _)| textures.release(result));
+
+		let drawn = |label: &str| textures.drawn_passes.iter().filter(|&&drawn| drawn == label).count();
+		assert_eq!((drawn("bevel_lit"), drawn("bevel_amount")), (2, 0));
 	}
 
 	#[test]

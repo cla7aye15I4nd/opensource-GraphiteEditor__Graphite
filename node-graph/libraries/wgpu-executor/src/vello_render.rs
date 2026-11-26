@@ -1,10 +1,12 @@
 use crate::vello_adjustments::adjustment_run_hash;
 use crate::vello_effects::{EffectPasses, EffectTextures};
 use crate::vello_generators::GeneratorPasses;
+use core_types::blending::BlendMode;
 use glam::{DAffine2, UVec2};
+use graphic_types::effect_layers::EffectLayers;
 use graphic_types::effects::EffectCapture;
 use graphic_types::raster_types::{CPU, Image, Raster, WeakCPU};
-use graphic_types::{Adjustment, EffectOperation, Effects};
+use graphic_types::{Adjustment, Effects};
 use rendering::vello_scene_builder::{EffectsRenderer, GeneratorTile, SceneImage, VelloSceneBuilder, image_downscale_factor, image_texture_size};
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -366,17 +368,19 @@ impl EffectsRenderer for RenderContext<'_> {
 		size: UVec2,
 		view: Affine,
 		effects: &Effects,
+		layers: &EffectLayers,
 		fill: f32,
+		opacity: f32,
 		effect_to_pixels: DAffine2,
 		capture: Option<EffectCapture>,
 		draw_paint: &mut dyn FnMut(usize, &mut VelloSceneBuilder),
 		draw: &mut dyn FnMut(&mut VelloSceneBuilder),
-	) -> wgpu::Texture {
+	) -> Vec<(wgpu::Texture, BlendMode)> {
 		let content_texture = self.canvas.effect_textures.acquire(self.device, size, self.renderer.precise_format);
 		self.render_area(draw, view, size, &content_texture, TargetAlpha::Premultiplied);
 
-		// The paint overlays' paints, each rendered over the same pixels as the content
-		let paint_count = effects.operations().filter(|operation| matches!(operation, EffectOperation::PaintOverlay { .. })).count();
+		// The effects' drawn paints, each rendered over the same pixels as the content
+		let paint_count = effects.operations().filter(|operation| operation.drawn_paint().is_some()).count();
 		let paint_textures: Vec<wgpu::Texture> = (0..paint_count)
 			.map(|index| {
 				let paint_texture = self.canvas.effect_textures.acquire(self.device, size, self.renderer.precise_format);
@@ -387,13 +391,16 @@ impl EffectsRenderer for RenderContext<'_> {
 
 		let effect_textures = &mut self.canvas.effect_textures;
 		let queue = self.queue.lock();
-		let result = (self.renderer.effect_passes).apply(
+		let effect_passes = &self.renderer.effect_passes;
+		let results = effect_passes.apply(
 			self.device,
 			&queue,
 			effect_textures,
 			&content_texture,
 			effects,
+			layers,
 			fill,
+			opacity,
 			effect_to_pixels.matrix2,
 			&paint_textures,
 			capture,
@@ -401,7 +408,7 @@ impl EffectsRenderer for RenderContext<'_> {
 		effect_textures.release(content_texture);
 		paint_textures.into_iter().for_each(|paint_texture| effect_textures.release(paint_texture));
 
-		result
+		results
 	}
 }
 

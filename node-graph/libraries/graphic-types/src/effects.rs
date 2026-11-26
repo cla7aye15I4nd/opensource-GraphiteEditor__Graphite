@@ -4,6 +4,7 @@
 
 use crate::Graphic;
 use crate::adjustment::Adjustment;
+use crate::masks::{MaskMode, mask_feather_sigma};
 use crate::parameters::{ParameterVisitor, ReadParameters, WriteParameters};
 use core_types::ATTR_TRANSFORM;
 use core_types::Color;
@@ -11,7 +12,7 @@ use core_types::blending::BlendMode;
 use core_types::color::SRGBA8;
 use core_types::graphene_hash::CacheHash;
 use core_types::list::{ATTR_EFFECTS, ATTR_OPACITY, ATTR_OPACITY_FILL, Item, List};
-use core_types::transfer_curve::TransferCurve;
+use core_types::transfer_curve::{TransferCurve, TransferCurveEvaluator};
 use dyn_any::DynAny;
 use glam::{DAffine2, DMat2, DVec2, DVec3};
 use std::borrow::Cow;
@@ -37,12 +38,16 @@ pub enum EffectKind {
 	InnerGlow,
 	/// Shades the content's interior with soft bands from its silhouette cast two ways.
 	Satin,
-	/// Draws a band of color along the content's silhouette.
+	/// Paints a band along the content's silhouette.
 	Outline,
 	/// Lights the content as if raised from the surface or pressed into it, with highlights and shadows along its edges.
 	BevelAndEmboss,
 	/// Paints over the content within its silhouette, mixing with its colors by a blend mode. A solid color paint is the color overlay adjustment.
 	PaintOverlay,
+	/// Hides the content where another graphic is dark or transparent.
+	Mask,
+	/// Fades the content out toward its edges, reaching nothing at them.
+	Feather,
 	// The adjustments, which change each color of the content on its own, as their nodes of the same names do
 	Desaturate,
 	GammaCorrection,
@@ -77,6 +82,8 @@ impl std::fmt::Display for EffectKind {
 			Self::Outline => "Outline",
 			Self::BevelAndEmboss => "Bevel & Emboss",
 			Self::PaintOverlay => "Paint Overlay",
+			Self::Mask => "Mask",
+			Self::Feather => "Feather",
 			Self::Desaturate => "Desaturate",
 			Self::GammaCorrection => "Gamma Correction",
 			Self::MakeOpaque => "Make Opaque",
@@ -133,6 +140,12 @@ pub struct EffectCapture {
 	pub index: usize,
 	/// Which of the effect's coverages, for an effect drawn from more than one.
 	pub plane: usize,
+}
+
+impl EffectCapture {
+	/// Not an effect's coverage but the share of each pixel within the content that its fill lets what lies beneath show through,
+	/// which the parts of interior pieces blending with what lies beneath are cut to (see [`crate::effect_layers::PiecePlace::Through`]).
+	pub const THROUGH_MASK: Self = Self { index: usize::MAX, plane: 0 };
 }
 
 /// The offset a shadow cast by light from `angle` (in degrees counterclockwise from the right) falls at `distance` from the content, in the document's y-down space.
@@ -217,23 +230,76 @@ pub fn bevel_light(angle: f64, altitude: f64, lengths_to_target: DMat2) -> DVec3
 	(across * altitude.cos()).extend(altitude.sin())
 }
 
-/// How much a bevel's surface sloping up by `gradient` (its rise per unit along each axis) is lit past a flat surface's brightness by the `light`, and how much it falls short, each from 0 to 1.
-pub fn bevel_lighting(gradient: DVec2, light: DVec3) -> (f64, f64) {
-	let lit = (-gradient).extend(1.).normalize().dot(light);
-	let highlight = if light.z < 1. { (lit - light.z) / (1. - light.z) } else { 0. };
-	let shadow = if light.z > 0. { (light.z - lit) / light.z } else { 0. };
+/// How lit a bevel's surface sloping up by `gradient` (its rise per unit along each axis) is by the `light`, from 0 facing away from it to 1 facing it.
+pub fn bevel_lit(gradient: DVec2, light: DVec3) -> f64 {
+	(-gradient).extend(1.).normalize().dot(light).clamp(0., 1.)
+}
+
+/// A bevel's highlight and shadow from 0 to 1, from how much brighter its surface is lit (after its gloss contour) than a flat surface's brightness `light_z`, negative where it's darker.
+/// For PSD interop, the flat brightness stays as it is under a gloss contour, so a curve that moves it shades even flat ground.
+pub fn bevel_lighting(brighter: f64, light_z: f64) -> (f64, f64) {
+	let highlight = if light_z < 1. { brighter / (1. - light_z) } else { 0. };
+	let shadow = if light_z > 0. { -brighter / light_z } else { 0. };
 	(highlight.clamp(0., 1.), shadow.clamp(0., 1.))
 }
 
-/// An overlay's paint with its unit square fitted to `content_bounds`, the content's extent in the space it's drawn in, if it's a gradient or image without its own placement.
-pub fn fitted_paint(paint: &Graphic, content_bounds: [DVec2; 2]) -> Option<Graphic> {
-	let unplaced = match paint {
+/// For PSD interop, under a gloss contour or a texture a bevel's highlight and shadow beneath the content reach no more than its height before its contour divided by this,
+/// so the flat ground they shade ends at the slopes' foot. It's the same as [`GRADIENT_GLOW_FADE`].
+pub const BEVEL_FOOT_FADE: f64 = 0.12;
+
+/// For PSD interop, the offsets from each pixel toward its right and lower neighbors at which an antialiased contour samples it, nine in all.
+pub const ANTIALIASED_CONTOUR_OFFSETS: [f64; 3] = [0., 1. / 3., 2. / 3.];
+
+/// Where a bevel's height `t` (0 at the foot of its slope and 1 on its top) falls along its contour, given the `range` percentage of the slope the contour spans.
+/// For PSD interop, an inner bevel's contour spans the range down from the top, an outer bevel's spans it up from the foot, and an emboss's spans the whole slope.
+pub fn slope_contour_input(t: f64, style: BevelStyle, range: f64) -> f64 {
+	let range = range.clamp(1., 100.) / 100.;
+	match style {
+		BevelStyle::InnerBevel => 1. - (1. - t) / range,
+		BevelStyle::OuterBevel => t / range,
+		BevelStyle::Emboss | BevelStyle::PillowEmboss => t,
+	}
+}
+
+/// Whether a bevel's contour reshapes its slopes, as any curve does, and a straight one does when it spans part of an inner or outer bevel's slopes.
+pub fn slope_contour_reshapes(contour: &TransferCurve, style: BevelStyle, range: f64) -> bool {
+	!contour.is_identity() || (range < 100. && matches!(style, BevelStyle::InnerBevel | BevelStyle::OuterBevel))
+}
+
+/// The slopes a bevel's contour continues along past its start and its end, for PSD interop, measured across its first and last steps of 1/255 within the curve's 0 to 1.
+pub fn contour_end_slopes(contour: &TransferCurveEvaluator) -> (f64, f64) {
+	let step = 1. / 255.;
+	let at = |x: f64| contour.evaluate(x).clamp(0., 1.);
+	((at(step) - at(0.)) / step, (at(1.) - at(1. - step)) / step)
+}
+
+/// A bevel's contour at `x`, from 0 to 1 within the curve, and continued past its ends along the `slopes` of [`contour_end_slopes`].
+pub fn extended_contour(contour: &TransferCurveEvaluator, (start_slope, end_slope): (f64, f64), x: f64) -> f64 {
+	match x {
+		x if x < 0. => contour.evaluate(0.).clamp(0., 1.) + start_slope * x,
+		x if x > 1. => contour.evaluate(1.).clamp(0., 1.) + end_slope * (x - 1.),
+		x => contour.evaluate(x).clamp(0., 1.),
+	}
+}
+
+/// How much a texture's color sinks a bevel's surface, from its premultiplied gamma-encoded channels: their luma, so a transparent texture leaves it flat.
+pub fn texture_gray([red, green, blue, _]: [f32; 4]) -> f32 {
+	0.299 * red + 0.587 * green + 0.114 * blue
+}
+
+/// Whether a paint is a gradient or image without its own placement, which stretches across the content it paints.
+pub fn is_unplaced_paint(paint: &Graphic) -> bool {
+	match paint {
 		Graphic::Gradient(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
 		Graphic::RasterCPU(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
 		Graphic::RasterGPU(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
 		_ => false,
-	};
-	if !unplaced {
+	}
+}
+
+/// An effect's drawn paint with its unit square fitted to `content_bounds`, the extent it fills in the space it's drawn in, if it's a gradient or image without its own placement.
+pub fn fitted_paint(paint: &Graphic, content_bounds: [DVec2; 2]) -> Option<Graphic> {
+	if !is_unplaced_paint(paint) {
 		return None;
 	}
 
@@ -246,6 +312,15 @@ pub fn fitted_paint(paint: &Graphic, content_bounds: [DVec2; 2]) -> Option<Graph
 		_ => {}
 	}
 	Some(paint)
+}
+
+/// The `graphic` expressed in the own space of content placed by `placement`, for an effect with a drawn graphic that follows the content (see [`EffectOperation::drawn_paint_follows_content`]).
+/// A gradient or image without its own placement stays as it is, since it stretches across the content wherever that lies.
+pub fn linked_to_content(graphic: Graphic, placement: DAffine2) -> Graphic {
+	if is_unplaced_paint(&graphic) || placement == DAffine2::IDENTITY || !placement.matrix2.determinant().is_normal() {
+		return graphic;
+	}
+	Graphic::Graphic(Box::new(Item::new_from_element(graphic).with_attribute(ATTR_TRANSFORM, placement.inverse())))
 }
 
 /// One image operation of an [`Effects`] list: an [`EffectKind`] plus its parameters, carried as attributes on the inner item.
@@ -288,7 +363,7 @@ impl Effect {
 	}
 }
 
-/// An item's ordered list of effects. A blur or adjustment acts on the result of those before it, shadows and glows included, while shadows and glows are cast from the content and stack in order beneath it (or within it, for an inner shadow).
+/// An item's ordered list of effects. A pixel filter (like a blur, adjustment, mask, or feather) acts on the result of those before it, shadows and glows included, while shadows and glows are cast from the content and stack in order beneath it (or within it, for an inner shadow).
 #[derive(Clone, Debug, Default, PartialEq, CacheHash)]
 pub struct Effects(pub List<Effect>);
 
@@ -332,6 +407,11 @@ impl Effects {
 		self.operations().map(|operation| operation.painted_reach()).sum()
 	}
 
+	/// How far past the content the effects together paint or read from, in the effect space of a run of them, which the region they're worked out over covers.
+	pub fn working_reach(&self) -> f64 {
+		self.operations().map(|operation| operation.working_reach()).sum()
+	}
+
 	/// Splits the rows into runs stamped in the same space, in order, each with the transform its effects were stamped at.
 	/// A transform applied between two effects starts a new run, which renders around the result of those before it.
 	/// Effects that change nothing join the run they're in, and a run of only those takes the space of the next effect.
@@ -358,11 +438,31 @@ impl Effects {
 		runs
 	}
 
-	/// Moves the transforms the effects were stamped at onto content whose `baked` transform went into its geometry.
+	/// Moves the transforms the effects were stamped at onto content whose `baked` transform went into its geometry, and the graphics that follow the content with them.
 	pub fn rebase_stamped_transforms(&mut self, baked: DAffine2) {
 		if let Some(transforms) = self.0.iter_attribute_values_mut::<DAffine2>(ATTR_TRANSFORM) {
 			transforms.for_each(|transform| *transform = rebased_stamped_transform(*transform, baked));
 		}
+
+		// A mask's graphic lies in the content's own space, which `baked` now places within the geometry
+		if baked == DAffine2::IDENTITY || !baked.matrix2.determinant().is_normal() {
+			return;
+		}
+		for effect in self.0.iter_element_values_mut() {
+			if effect.kind() == EffectKind::Mask
+				&& let Some(mask) = effect.0.attribute_mut::<Graphic>("mask")
+				&& !is_unplaced_paint(mask)
+			{
+				*mask = Graphic::Graphic(Box::new(Item::new_from_element(std::mem::take(mask)).with_attribute(ATTR_TRANSFORM, baked)));
+			}
+		}
+	}
+
+	/// The mask and feather rows alone, with the transforms they were stamped at, or `None` without any. They shape what clips to the content as they shape the content itself, unlike the other effects.
+	pub fn shaping_only(&self) -> Option<Effects> {
+		let shapes = |index: &usize| self.0.element(*index).is_some_and(|effect| matches!(effect.kind(), EffectKind::Mask | EffectKind::Feather));
+		let shaping: List<Effect> = (0..self.len()).filter(shapes).filter_map(|index| self.0.clone_item(index)).collect();
+		(!shaping.is_empty()).then_some(Effects(shaping))
 	}
 
 	/// The effects of a run of rows, borrowed when the run is every row.
@@ -383,6 +483,13 @@ impl Effects {
 		(self.runs().into_iter())
 			.map(|(stamped_transform, rows)| self.operations_in(rows).map(|operation| reach(&operation)).sum::<f64>() * spans_along_axes(effect_space(content_transform, stamped_transform).matrix2))
 			.sum()
+	}
+
+	/// How far a unit of each effect's lengths spans along each axis of the space `content_transform` places the content in, in order.
+	pub fn length_spans(&self, content_transform: DAffine2) -> Vec<DVec2> {
+		(self.runs().into_iter())
+			.flat_map(|(stamped_transform, rows)| std::iter::repeat_n(spans_along_axes(effect_space(content_transform, stamped_transform).matrix2), rows.len()))
+			.collect()
 	}
 
 	/// How far past the content the effects reading around each pixel (see [`EffectOperation::reads_pixels_around`]) together read, along the axis of the space `content_transform` places the content in that they read furthest along.
@@ -414,6 +521,9 @@ fn same_linear_part(first: DMat2, second: DMat2) -> bool {
 /// For PSD interop, an outer glow filled with a gradient fades out once its strength before range and contour falls below this.
 pub const GRADIENT_GLOW_FADE: f64 = 0.12;
 
+/// How many evenly spaced samples of a glow's or outline's gradient the renderers look its colors up in, enough to follow it within a level.
+pub const GRADIENT_TABLE_SIZE: usize = 256;
+
 /// What fills a glow: a solid color its strength fades, or a gradient its strength runs across, from the gradient's start at full strength to its end at none.
 pub enum GlowFill {
 	Solid(Color),
@@ -434,9 +544,10 @@ impl GlowFill {
 			let color = *item.element();
 			Self::Solid(color.with_alpha(color.a() * opacity(item.attribute(ATTR_OPACITY), item.attribute(ATTR_OPACITY_FILL))))
 		};
+		// A gradient without stops reads as black
 		let gradient = |item: &Item<Gradient>| Self::Gradient {
 			evaluator: Box::new(item.element().evaluator(GradientSettings::from_item_attributes(item))),
-			visible: item.element().0.iter_element_values().any(|stop| stop.a() > 0.),
+			visible: item.element().is_empty() || item.element().0.iter_element_values().any(|stop| stop.a() > 0.),
 			opacity: opacity(item.attribute(ATTR_OPACITY), item.attribute(ATTR_OPACITY_FILL)),
 		};
 
@@ -485,6 +596,65 @@ pub fn outline_extents(weight: f64, align: StrokeAlign) -> (f64, f64) {
 		StrokeAlign::Inside => (0., weight),
 		StrokeAlign::Center => (weight / 2., weight / 2.),
 	}
+}
+
+/// What fills an outline: a solid color tinting its coverage, a gradient run across its width, or a graphic the renderers draw over the same pixels.
+pub enum OutlineFill<'a> {
+	Solid(Color),
+	/// A contour gradient, with its position following the distance across the outline's width rather than its placement (PSD's Shape Burst, for interop).
+	ContourGradient(GlowFill),
+	Drawn(&'a Graphic),
+}
+
+impl<'a> OutlineFill<'a> {
+	/// The fill an outline's `paint` makes, or `None` for no paint. A gradient runs across the outline's width if `contour_gradient`, and any other paint ignores it.
+	/// A list of several colors or gradients is drawn, which composites them all.
+	pub fn of(paint: &'a Graphic, contour_gradient: bool) -> Option<Self> {
+		let list_length = match paint {
+			Graphic::None(_) | Graphic::NoneList(_) => return None,
+			Graphic::ColorList(list) => list.len(),
+			Graphic::GradientList(list) => list.len(),
+			_ => 1,
+		};
+		if list_length == 0 {
+			return None;
+		}
+
+		let single = list_length == 1;
+		Some(match paint {
+			Graphic::Color(_) | Graphic::ColorList(_) if single => Self::Solid(match GlowFill::of(paint)? {
+				GlowFill::Solid(color) => color,
+				GlowFill::Gradient { .. } => return None,
+			}),
+			Graphic::Gradient(_) | Graphic::GradientList(_) if single && contour_gradient => Self::ContourGradient(GlowFill::of(paint)?),
+			_ => Self::Drawn(paint),
+		})
+	}
+
+	/// Whether the fill paints nothing anywhere.
+	pub fn is_invisible(&self) -> bool {
+		match self {
+			Self::Solid(color) => color.a() <= 0.,
+			Self::ContourGradient(gradient) => gradient.is_invisible(),
+			Self::Drawn(_) => false,
+		}
+	}
+}
+
+/// Where a contour gradient across an outline of `weight` starts, as a distance past the content's edge, and how far inward it spans.
+/// A point `distance` past the edge (negative inside it) takes the position `(start - distance) / span`, clamped from 0 to 1 and rounded by [`contour_gradient_position`].
+/// For PSD interop, it spans from half a unit outside the outline to half a unit past its inner edge, or a unit and a half for a centered outline.
+pub fn contour_gradient_span(weight: f64, align: StrokeAlign) -> (f64, f64) {
+	let (outside, _) = outline_extents(weight, align);
+	let span = weight + if align == StrokeAlign::Center { 2. } else { 1. };
+	(outside + 0.5, span)
+}
+
+/// The position from 0 to 1 along a contour gradient that a point `distance` past the content's edge takes, given the `start` and `span` of [`contour_gradient_span`].
+/// It's rounded to the nearest of the gradient's [`GRADIENT_TABLE_SIZE`] samples, which for PSD interop are 8-bit levels, so every renderer reads the same sample even at a hard stop.
+pub fn contour_gradient_position(distance: f32, start: f32, span: f32) -> f32 {
+	let last = (GRADIENT_TABLE_SIZE - 1) as f32;
+	(((start - distance) / span).clamp(0., 1.) * last + 0.5).floor() / last
 }
 
 /// Appends an effect to the item's list, after those already applied to it, recording the item's transform at that point.
@@ -567,6 +737,8 @@ pub enum EffectOperation {
 	DropShadow {
 		/// With the shadow's opacity.
 		color: Color,
+		/// How the shadow mixes with what lies beneath the content.
+		blend_mode: BlendMode,
 		/// The direction the light comes from, in degrees counterclockwise from the right.
 		angle: f64,
 		distance: f64,
@@ -579,6 +751,8 @@ pub enum EffectOperation {
 	},
 	InnerShadow {
 		color: Color,
+		/// How the shadow mixes with the content and what shows through it.
+		blend_mode: BlendMode,
 		angle: f64,
 		distance: f64,
 		/// The percentage of the size that hardens into a grow inward from the edges rather than softening.
@@ -589,6 +763,8 @@ pub enum EffectOperation {
 	OuterGlow {
 		/// A solid color with the glow's opacity, or a gradient running from the content's edge outward.
 		color: Graphic,
+		/// How the glow mixes with what lies beneath the content.
+		blend_mode: BlendMode,
 		technique: GlowTechnique,
 		spread: f64,
 		size: f64,
@@ -599,6 +775,8 @@ pub enum EffectOperation {
 	InnerGlow {
 		/// A solid color with the glow's opacity, or a gradient running from the content's edge inward (or from its center outward).
 		color: Graphic,
+		/// How the glow mixes with the content and what shows through it.
+		blend_mode: BlendMode,
 		technique: GlowTechnique,
 		source: GlowSource,
 		/// The percentage of the size that hardens into a grow inward from the edges rather than softening.
@@ -609,6 +787,8 @@ pub enum EffectOperation {
 	},
 	Satin {
 		color: Color,
+		/// How the shading mixes with the content and what shows through it.
+		blend_mode: BlendMode,
 		/// The direction each of the two casts of the silhouette is moved along, one each way, in degrees counterclockwise from the right.
 		angle: f64,
 		distance: f64,
@@ -617,9 +797,14 @@ pub enum EffectOperation {
 		contour: TransferCurve,
 	},
 	Outline {
-		color: Color,
+		/// A solid color with the outline's opacity, a gradient, or any graphic, fitted when unplaced to the content and the outline's margin.
+		paint: Graphic,
+		/// How the outline mixes with what lies beneath it, or with the content for the part inside its edge.
+		blend_mode: BlendMode,
 		weight: f64,
 		align: StrokeAlign,
+		/// Whether a gradient paint runs across the outline's width rather than by its own placement.
+		contour_gradient: bool,
 	},
 	BevelAndEmboss {
 		style: BevelStyle,
@@ -628,6 +813,7 @@ pub enum EffectOperation {
 		depth: f64,
 		direction: BevelDirection,
 		/// How wide the slopes are.
+		/// For PSD interop, an importer maps a Smooth inner bevel's Size 0 (a one-pixel step at any depth) to Size 0.5 at Depth 200%.
 		size: f64,
 		/// How much the highlights and shadows are blurred.
 		soften: f64,
@@ -637,12 +823,26 @@ pub enum EffectOperation {
 		altitude: f64,
 		/// With the highlight's opacity.
 		highlight_color: Color,
-		/// How the highlight mixes with the content's colors.
+		/// How the highlight mixes with the colors beneath it.
 		highlight_blend_mode: BlendMode,
 		/// With the shadow's opacity.
 		shadow_color: Color,
-		/// How the shadow mixes with the content's colors.
+		/// How the shadow mixes with the colors beneath it.
 		shadow_blend_mode: BlendMode,
+		/// A graphic with lightness that sinks the surface, or none.
+		texture: Graphic,
+		/// The percentage of the slopes' width that the texture's lightest parts sink by, raising them when negative.
+		texture_depth: f64,
+		/// The percentage of the slopes the slope contour spans.
+		slope_range: f64,
+		/// Whether the gloss contour is sampled across each pixel, smoothing its steep parts.
+		gloss_antialiased: bool,
+		/// Whether the slope contour is sampled across each pixel, smoothing its steep parts.
+		slope_antialiased: bool,
+		/// Reshapes how lit the slopes are, from facing away from the light to facing it.
+		gloss_contour: TransferCurve,
+		/// Reshapes the slopes' profile.
+		slope_contour: TransferCurve,
 	},
 	/// Paints over the content with a paint other than a solid color, since a solid one decodes into the color overlay adjustment instead.
 	PaintOverlay {
@@ -651,6 +851,22 @@ pub enum EffectOperation {
 		blend_mode: BlendMode,
 		/// Percent.
 		opacity: f64,
+	},
+	/// Multiplies the content by how much the mask graphic shows it, after what lies beneath the content joins it.
+	Mask {
+		/// Lies in the content's own space, so it moves with the content.
+		mask: Graphic,
+		mode: MaskMode,
+		/// The percentage of how much the mask hides that it keeps.
+		density: f64,
+		/// How much the mask is softened, which [`mask_feather_sigma`] makes a Gaussian's standard deviation.
+		feather: f64,
+		invert: bool,
+	},
+	/// Multiplies the content by the strength [`crate::masks::feather_parts`] defines, after what lies beneath the content joins it.
+	Feather {
+		/// How far in from the edges the fade reaches full strength.
+		distance: f64,
 	},
 	Adjustment(Adjustment),
 }
@@ -672,6 +888,8 @@ impl EffectOperation {
 			Self::Outline { .. } => EffectKind::Outline,
 			Self::BevelAndEmboss { .. } => EffectKind::BevelAndEmboss,
 			Self::PaintOverlay { .. } => EffectKind::PaintOverlay,
+			Self::Mask { .. } => EffectKind::Mask,
+			Self::Feather { .. } => EffectKind::Feather,
 			Self::Adjustment(adjustment) => adjustment.kind(),
 		}
 	}
@@ -682,11 +900,19 @@ impl EffectOperation {
 			Self::Blur { radius, .. } => *radius <= 0.,
 			Self::DropShadow { color, .. } | Self::InnerShadow { color, .. } | Self::Satin { color, .. } => color.a() <= 0.,
 			Self::OuterGlow { color, .. } | Self::InnerGlow { color, .. } => GlowFill::of(color).is_none_or(|fill| fill.is_invisible()),
-			Self::Outline { color, weight, .. } => color.a() <= 0. || *weight <= 0.,
+			Self::Outline { paint, weight, contour_gradient, .. } => *weight <= 0. || OutlineFill::of(paint, *contour_gradient).is_none_or(|fill| fill.is_invisible()),
+			// A gloss contour shades even flat ground, so a bevel without slopes still draws it
 			Self::BevelAndEmboss {
-				highlight_color, shadow_color, size, ..
-			} => (highlight_color.a() <= 0. && shadow_color.a() <= 0.) || *size <= 0.,
+				highlight_color,
+				shadow_color,
+				size,
+				gloss_contour,
+				..
+			} => (highlight_color.a() <= 0. && shadow_color.a() <= 0.) || (*size <= 0. && gloss_contour.is_identity()),
 			Self::PaintOverlay { opacity, .. } => *opacity <= 0.,
+			Self::Adjustment(Adjustment::ColorOverlay { color, opacity, .. }) => color.a() <= 0. || *opacity <= 0.,
+			Self::Mask { density, .. } => *density <= 0.,
+			Self::Feather { distance } => *distance <= 0.,
 			Self::Adjustment(_) => false,
 		}
 	}
@@ -695,14 +921,30 @@ impl EffectOperation {
 	pub fn reads_pixels_around(&self) -> bool {
 		match self {
 			Self::Blur { .. } => true,
-			// Cast from the content's shape or changing each pixel alone
-			Self::DropShadow { .. } | Self::InnerShadow { .. } | Self::OuterGlow { .. } | Self::InnerGlow { .. } | Self::Satin { .. } | Self::Outline { .. } | Self::BevelAndEmboss { .. } => false,
-			Self::PaintOverlay { .. } | Self::Adjustment(_) => false,
+			// Cast from the content's shape, reading a mask's own image or a feather's map, or changing each pixel alone
+			Self::DropShadow { .. }
+			| Self::InnerShadow { .. }
+			| Self::OuterGlow { .. }
+			| Self::InnerGlow { .. }
+			| Self::Satin { .. }
+			| Self::Outline { .. }
+			| Self::BevelAndEmboss { .. }
+			| Self::Feather { .. } => false,
+			Self::PaintOverlay { .. } | Self::Mask { .. } | Self::Adjustment(_) => false,
 		}
 	}
 
-	/// How far past the content this operation paints, which is nowhere for an operation that changes nothing.
+	/// How far past the content this operation paints, which is nowhere for an operation that changes nothing, a mask, or a feather.
 	pub fn painted_reach(&self) -> f64 {
+		if self.changes_nothing() || matches!(self, Self::Mask { .. } | Self::Feather { .. }) {
+			0.
+		} else {
+			self.reach()
+		}
+	}
+
+	/// How far past the content this operation paints or reads from, which the region it's worked out over covers, and nowhere for an operation that changes nothing.
+	pub fn working_reach(&self) -> f64 {
 		if self.changes_nothing() { 0. } else { self.reach() }
 	}
 
@@ -719,7 +961,53 @@ impl EffectOperation {
 			Self::Satin { distance, size, .. } => distance.abs() + size.max(0.) + 1.,
 			Self::Outline { weight, .. } => weight.max(0.) + 1.,
 			Self::BevelAndEmboss { size, soften, .. } => size.max(0.) + soften.max(0.) + 2.,
+			// A mask paints nothing past the content, but its feather reads the mask this far past it
+			Self::Mask { feather, .. } => 3. * mask_feather_sigma(*feather),
+			// A feather paints nothing past the content, but finds edges up to this far past it, which a render cut short there would miss
+			Self::Feather { distance } => distance.max(0.) + 1.,
 			Self::PaintOverlay { .. } | Self::Adjustment(_) => 0.,
+		}
+	}
+
+	/// The graphic this operation paints with that renderers draw over the content's pixels on their own: a paint overlay's paint, an outline's drawn paint, a bevel's texture, or a mask's graphic.
+	/// An operation that changes nothing draws none, since renderers skip it.
+	pub fn drawn_paint(&self) -> Option<&Graphic> {
+		if self.changes_nothing() {
+			return None;
+		}
+
+		match self {
+			Self::PaintOverlay { paint, .. } => Some(paint),
+			Self::Outline { paint, contour_gradient, .. } => match OutlineFill::of(paint, *contour_gradient)? {
+				OutlineFill::Drawn(paint) => Some(paint),
+				_ => None,
+			},
+			Self::BevelAndEmboss { texture, .. } => (!matches!(texture, Graphic::None(_) | Graphic::NoneList(_))).then_some(texture),
+			Self::Mask { mask, .. } => Some(mask),
+			_ => None,
+		}
+	}
+
+	/// Whether the graphic this operation draws with is placed in the content's own space, so it moves with the content, rather than in the space the content's item is placed in.
+	/// The nodes stamping such operations express the graphic relative to the content's placement at that time with [`linked_to_content`].
+	pub fn drawn_paint_follows_content(&self) -> bool {
+		matches!(self, Self::Mask { .. })
+	}
+
+	/// The bounds a drawn paint without its own placement is fitted to, given the content's bounds and the length a document pixel spans along each of their axes.
+	/// For PSD interop, an outline's paint fits the content grown by the whole pixels the outline reaches outside it, at least one.
+	pub fn drawn_paint_bounds(&self, content_bounds: [DVec2; 2], pixel_spans: DVec2) -> [DVec2; 2] {
+		match self {
+			Self::Outline { weight, align, .. } => {
+				// Interpolated between the whole weights PSD stores
+				let margin_at = |weight: f64| outline_extents(weight, *align).0.ceil().max(1.);
+				let weight = weight.max(0.);
+				let below = weight.floor();
+				let margin = margin_at(below) + (margin_at(below + 1.) - margin_at(below)) * (weight - below);
+
+				[content_bounds[0] - margin * pixel_spans, content_bounds[1] + margin * pixel_spans]
+			}
+			_ => content_bounds,
 		}
 	}
 
@@ -744,8 +1032,17 @@ impl EffectOperation {
 			Self::Satin { angle, distance, size, .. } => [angle, distance, size].into_iter().for_each(finite),
 			Self::Outline { weight, .. } => finite(weight),
 			Self::BevelAndEmboss {
-				depth, size, soften, angle, altitude, ..
-			} => [depth, size, soften, angle, altitude].into_iter().for_each(finite),
+				depth,
+				size,
+				soften,
+				angle,
+				altitude,
+				slope_range,
+				texture_depth,
+				..
+			} => [depth, size, soften, angle, altitude, slope_range, texture_depth].into_iter().for_each(finite),
+			Self::Mask { density, feather, .. } => [density, feather].into_iter().for_each(finite),
+			Self::Feather { distance } => finite(distance),
 			Self::PaintOverlay { .. } | Self::Adjustment(_) => {}
 		}
 		self
@@ -761,6 +1058,7 @@ impl EffectOperation {
 			},
 			EffectKind::DropShadow => Self::DropShadow {
 				color: Color::TRANSPARENT,
+				blend_mode: BlendMode::default(),
 				angle: 0.,
 				distance: 0.,
 				spread: 0.,
@@ -770,6 +1068,7 @@ impl EffectOperation {
 			},
 			EffectKind::InnerShadow => Self::InnerShadow {
 				color: Color::TRANSPARENT,
+				blend_mode: BlendMode::default(),
 				angle: 0.,
 				distance: 0.,
 				choke: 0.,
@@ -778,6 +1077,7 @@ impl EffectOperation {
 			},
 			EffectKind::OuterGlow => Self::OuterGlow {
 				color: Graphic::default(),
+				blend_mode: BlendMode::default(),
 				technique: GlowTechnique::default(),
 				spread: 0.,
 				size: 0.,
@@ -786,6 +1086,7 @@ impl EffectOperation {
 			},
 			EffectKind::InnerGlow => Self::InnerGlow {
 				color: Graphic::default(),
+				blend_mode: BlendMode::default(),
 				technique: GlowTechnique::default(),
 				source: GlowSource::default(),
 				choke: 0.,
@@ -795,6 +1096,7 @@ impl EffectOperation {
 			},
 			EffectKind::Satin => Self::Satin {
 				color: Color::TRANSPARENT,
+				blend_mode: BlendMode::default(),
 				angle: 0.,
 				distance: 0.,
 				size: 0.,
@@ -802,9 +1104,11 @@ impl EffectOperation {
 				contour: TransferCurve::default(),
 			},
 			EffectKind::Outline => Self::Outline {
-				color: Color::TRANSPARENT,
+				paint: Graphic::default(),
+				blend_mode: BlendMode::default(),
 				weight: 0.,
 				align: StrokeAlign::default(),
+				contour_gradient: false,
 			},
 			EffectKind::BevelAndEmboss => Self::BevelAndEmboss {
 				style: BevelStyle::default(),
@@ -819,12 +1123,27 @@ impl EffectOperation {
 				highlight_blend_mode: BlendMode::default(),
 				shadow_color: Color::TRANSPARENT,
 				shadow_blend_mode: BlendMode::default(),
+				texture: Graphic::default(),
+				texture_depth: 0.,
+				slope_range: 0.,
+				gloss_antialiased: false,
+				slope_antialiased: false,
+				gloss_contour: TransferCurve::default(),
+				slope_contour: TransferCurve::default(),
 			},
 			EffectKind::PaintOverlay => Self::PaintOverlay {
 				paint: Graphic::default(),
 				blend_mode: BlendMode::default(),
 				opacity: 0.,
 			},
+			EffectKind::Mask => Self::Mask {
+				mask: Graphic::default(),
+				mode: MaskMode::default(),
+				density: 0.,
+				feather: 0.,
+				invert: false,
+			},
+			EffectKind::Feather => Self::Feather { distance: 0. },
 			EffectKind::Desaturate => Self::Adjustment(Adjustment::Desaturate { method: Default::default() }),
 			EffectKind::GammaCorrection => Self::Adjustment(Adjustment::GammaCorrection { gamma: 0., inverse: false }),
 			EffectKind::MakeOpaque => Self::Adjustment(Adjustment::MakeOpaque),
@@ -877,6 +1196,7 @@ impl EffectOperation {
 			}
 			Self::DropShadow {
 				color,
+				blend_mode,
 				angle,
 				distance,
 				spread,
@@ -885,6 +1205,7 @@ impl EffectOperation {
 				knockout,
 			} => {
 				visitor.parameter("color", color, shadow_color);
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Multiply);
 				visitor.parameter("angle", angle, 120.);
 				visitor.parameter("distance", distance, 5.);
 				visitor.parameter("spread", spread, 0.);
@@ -894,6 +1215,7 @@ impl EffectOperation {
 			}
 			Self::InnerShadow {
 				color,
+				blend_mode,
 				angle,
 				distance,
 				choke,
@@ -901,6 +1223,7 @@ impl EffectOperation {
 				contour,
 			} => {
 				visitor.parameter("color", color, shadow_color);
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Multiply);
 				visitor.parameter("angle", angle, 120.);
 				visitor.parameter("distance", distance, 5.);
 				visitor.parameter("choke", choke, 0.);
@@ -909,6 +1232,7 @@ impl EffectOperation {
 			}
 			Self::OuterGlow {
 				color,
+				blend_mode,
 				technique,
 				spread,
 				size,
@@ -916,6 +1240,7 @@ impl EffectOperation {
 				contour,
 			} => {
 				visitor.parameter("color", color, Graphic::from(glow_color));
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Screen);
 				visitor.parameter("technique", technique, GlowTechnique::default());
 				visitor.parameter("spread", spread, 0.);
 				visitor.parameter("size", size, 5.);
@@ -924,6 +1249,7 @@ impl EffectOperation {
 			}
 			Self::InnerGlow {
 				color,
+				blend_mode,
 				technique,
 				source,
 				choke,
@@ -932,6 +1258,7 @@ impl EffectOperation {
 				contour,
 			} => {
 				visitor.parameter("color", color, Graphic::from(glow_color));
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Screen);
 				visitor.parameter("technique", technique, GlowTechnique::default());
 				visitor.parameter("source", source, GlowSource::default());
 				visitor.parameter("choke", choke, 0.);
@@ -941,6 +1268,7 @@ impl EffectOperation {
 			}
 			Self::Satin {
 				color,
+				blend_mode,
 				angle,
 				distance,
 				size,
@@ -948,16 +1276,25 @@ impl EffectOperation {
 				contour,
 			} => {
 				visitor.parameter("color", color, Color::from(SRGBA8::new(0, 0, 0, 0x80)));
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Multiply);
 				visitor.parameter("angle", angle, 19.);
 				visitor.parameter("distance", distance, 11.);
 				visitor.parameter("size", size, 14.);
 				visitor.parameter("invert", invert, true);
 				visitor.parameter("contour", contour, TransferCurve::default());
 			}
-			Self::Outline { color, weight, align } => {
-				visitor.parameter("color", color, Color::BLACK);
+			Self::Outline {
+				paint,
+				blend_mode,
+				weight,
+				align,
+				contour_gradient,
+			} => {
+				visitor.parameter("paint", paint, Graphic::from(Color::BLACK));
+				visitor.parameter("blend_mode", blend_mode, BlendMode::Normal);
 				visitor.parameter("weight", weight, 3.);
 				visitor.parameter("align", align, StrokeAlign::Outside);
+				visitor.parameter("contour_gradient", contour_gradient, false);
 			}
 			Self::BevelAndEmboss {
 				style,
@@ -972,6 +1309,13 @@ impl EffectOperation {
 				highlight_blend_mode,
 				shadow_color,
 				shadow_blend_mode,
+				texture,
+				texture_depth,
+				slope_range,
+				gloss_antialiased,
+				slope_antialiased,
+				gloss_contour,
+				slope_contour,
 			} => {
 				visitor.parameter("style", style, BevelStyle::default());
 				visitor.parameter("technique", technique, BevelTechnique::default());
@@ -985,12 +1329,27 @@ impl EffectOperation {
 				visitor.parameter("highlight_blend_mode", highlight_blend_mode, BlendMode::Screen);
 				visitor.parameter("shadow_color", shadow_color, Color::from(SRGBA8::new(0, 0, 0, 0xbf)));
 				visitor.parameter("shadow_blend_mode", shadow_blend_mode, BlendMode::Multiply);
+				visitor.parameter("texture", texture, Graphic::default());
+				visitor.parameter("texture_depth", texture_depth, 100.);
+				visitor.parameter("slope_range", slope_range, 100.);
+				visitor.parameter("gloss_antialiased", gloss_antialiased, false);
+				visitor.parameter("slope_antialiased", slope_antialiased, false);
+				visitor.parameter("gloss_contour", gloss_contour, TransferCurve::default());
+				visitor.parameter("slope_contour", slope_contour, TransferCurve::default());
 			}
 			Self::PaintOverlay { paint, blend_mode, opacity } => {
 				visitor.parameter("paint", paint, Graphic::from(Color::BLACK));
 				visitor.parameter("blend_mode", blend_mode, BlendMode::default());
 				visitor.parameter("opacity", opacity, 100.);
 			}
+			Self::Mask { mask, mode, density, feather, invert } => {
+				visitor.parameter("mask", mask, Graphic::default());
+				visitor.parameter("mode", mode, MaskMode::default());
+				visitor.parameter("density", density, 100.);
+				visitor.parameter("feather", feather, 0.);
+				visitor.parameter("invert", invert, false);
+			}
+			Self::Feather { distance } => visitor.parameter("distance", distance, 10.),
 			Self::Adjustment(adjustment) => adjustment.visit_parameters(visitor),
 		}
 	}
@@ -1012,6 +1371,7 @@ mod tests {
 			EffectOperation::default_for(EffectKind::DropShadow),
 			EffectOperation::InnerShadow {
 				color: Color::RED,
+				blend_mode: BlendMode::Normal,
 				angle: 30.,
 				distance: 3.,
 				choke: 25.,
@@ -1020,6 +1380,7 @@ mod tests {
 			},
 			EffectOperation::OuterGlow {
 				color: Graphic::from(Color::BLUE),
+				blend_mode: BlendMode::Lighten,
 				technique: GlowTechnique::Precise,
 				spread: 10.,
 				size: 8.,
@@ -1028,6 +1389,7 @@ mod tests {
 			},
 			EffectOperation::InnerGlow {
 				color: Graphic::from(Color::GREEN),
+				blend_mode: BlendMode::Screen,
 				technique: GlowTechnique::Precise,
 				source: GlowSource::Center,
 				choke: 20.,
@@ -1037,6 +1399,7 @@ mod tests {
 			},
 			EffectOperation::Satin {
 				color: Color::BLACK,
+				blend_mode: BlendMode::ColorBurn,
 				angle: 45.,
 				distance: 6.,
 				size: 2.,
@@ -1044,9 +1407,22 @@ mod tests {
 				contour: TransferCurve::new(vec![DVec2::ZERO, DVec2::new(0.5, 1.), DVec2::ONE]),
 			},
 			EffectOperation::Outline {
-				color: Color::RED,
+				paint: Graphic::from(Color::RED),
+				blend_mode: BlendMode::Difference,
 				weight: 7.,
 				align: StrokeAlign::Center,
+				contour_gradient: false,
+			},
+			EffectOperation::Outline {
+				paint: Graphic::from(Gradient::new([0., 1.].map(|position| GradientStop {
+					position,
+					midpoint: 0.5,
+					color: Color::from_rgbaf32_unchecked(1., position as f32, 0., 1.),
+				}))),
+				blend_mode: BlendMode::Multiply,
+				weight: 4.,
+				align: StrokeAlign::Inside,
+				contour_gradient: true,
 			},
 			EffectOperation::BevelAndEmboss {
 				style: BevelStyle::PillowEmboss,
@@ -1061,6 +1437,13 @@ mod tests {
 				highlight_blend_mode: BlendMode::Overlay,
 				shadow_color: Color::BLUE,
 				shadow_blend_mode: BlendMode::Normal,
+				gloss_contour: TransferCurve::new(vec![DVec2::ZERO, DVec2::new(0.5, 1.), DVec2::X]),
+				gloss_antialiased: true,
+				slope_contour: TransferCurve::new(vec![DVec2::ZERO, DVec2::new(0.5, 0.25), DVec2::ONE]),
+				slope_antialiased: true,
+				slope_range: 50.,
+				texture: Graphic::from(Gradient::default()),
+				texture_depth: -250.,
 			},
 			EffectOperation::PaintOverlay {
 				paint: Graphic::from(Gradient::new([0., 1.].map(|position| GradientStop {
@@ -1071,6 +1454,14 @@ mod tests {
 				blend_mode: BlendMode::Multiply,
 				opacity: 60.,
 			},
+			EffectOperation::Mask {
+				mask: Graphic::from(Color::WHITE),
+				mode: MaskMode::Alpha,
+				density: 40.,
+				feather: 3.5,
+				invert: true,
+			},
+			EffectOperation::Feather { distance: 4.5 },
 			EffectOperation::Adjustment(Adjustment::ColorOverlay {
 				color: Color::GREEN,
 				blend_mode: BlendMode::Screen,
@@ -1107,6 +1498,7 @@ mod tests {
 	fn lengths_that_arent_finite_decode_as_zero() {
 		let row = Effect::new(&EffectOperation::DropShadow {
 			color: Color::BLACK,
+			blend_mode: BlendMode::Multiply,
 			angle: 90.,
 			distance: f64::NAN,
 			spread: 3.,
@@ -1148,6 +1540,74 @@ mod tests {
 		assert!((precise_falloff(1., 0., 16.) - 16. / 34.).abs() < 1e-12);
 		assert_eq!(precise_falloff(17., 0., 16.), 0.);
 		assert_eq!(precise_falloff(0., 16., 16.), 1.);
+	}
+
+	#[test]
+	fn outline_paints_fit_the_whole_pixels_the_outline_reaches_outside() {
+		let margin = |weight, align| {
+			let outline = EffectOperation::Outline {
+				paint: Graphic::from(Gradient::default()),
+				blend_mode: BlendMode::Normal,
+				weight,
+				align,
+				contour_gradient: false,
+			};
+			outline.drawn_paint_bounds([DVec2::ZERO, DVec2::splat(10.)], DVec2::ONE)[1].x - 10.
+		};
+
+		assert_eq!(margin(8., StrokeAlign::Outside), 8.);
+		// A centered outline of odd weight reaches into one more pixel, and one inside still fits a pixel past the content
+		assert_eq!(margin(7., StrokeAlign::Center), 4.);
+		assert_eq!(margin(40., StrokeAlign::Center), 20.);
+		assert_eq!(margin(8., StrokeAlign::Inside), 1.);
+		// Between whole weights, the margin is interpolated
+		assert_eq!(margin(6.5, StrokeAlign::Center), 3.5);
+
+		// In a space a document pixel spans unevenly, the margin is measured along each axis
+		let outline = EffectOperation::Outline {
+			paint: Graphic::from(Gradient::default()),
+			blend_mode: BlendMode::Normal,
+			weight: 4.,
+			align: StrokeAlign::Outside,
+			contour_gradient: false,
+		};
+		assert_eq!(
+			outline.drawn_paint_bounds([DVec2::ZERO, DVec2::splat(10.)], DVec2::new(2., 0.5)),
+			[DVec2::new(-8., -2.), DVec2::new(18., 12.)]
+		);
+	}
+
+	#[test]
+	fn bevel_contours_continue_straight_past_their_ends() {
+		// Inner and outer bevels map the range down from the top and up from the foot, while an emboss maps its whole slope
+		assert_eq!(slope_contour_input(0.75, BevelStyle::InnerBevel, 50.), 0.5);
+		assert_eq!(slope_contour_input(0.25, BevelStyle::OuterBevel, 50.), 0.5);
+		assert_eq!(slope_contour_input(0.3, BevelStyle::Emboss, 25.), 0.3);
+
+		// A curve dipping below 0 near its start is held flat there, and so continues flat before it
+		let dipping = TransferCurve::new(vec![DVec2::ZERO, DVec2::new(0.75, 0.), DVec2::ONE]).evaluator();
+		let slopes = contour_end_slopes(&dipping);
+		assert_eq!(slopes.0, 0.);
+		assert_eq!(extended_contour(&dipping, slopes, -0.5), 0.);
+
+		// A straight contour continues along its slope either way, and meets its ends there
+		let straight = TransferCurve::default().evaluator();
+		let slopes = contour_end_slopes(&straight);
+		for x in [-0.5, 0., 1., 1.5] {
+			assert!((extended_contour(&straight, slopes, x) - x).abs() < 1e-6, "the straight contour at {x}");
+		}
+	}
+
+	#[test]
+	fn contour_gradient_positions_land_on_the_gradients_samples() {
+		// An outline of 3 aligned outside spans from 3.5 past the edge to 0.5 inside it, so its middle pixel lies halfway
+		let (start, span) = contour_gradient_span(3., StrokeAlign::Outside);
+		assert_eq!((start, span), (3.5, 4.));
+		assert_eq!(contour_gradient_position(1.5, start as f32, span as f32), 128. / 255.);
+		assert_eq!(contour_gradient_position(-5., start as f32, span as f32), 1.);
+
+		// A centered outline spans a unit more
+		assert_eq!(contour_gradient_span(8., StrokeAlign::Center), (4.5, 10.));
 	}
 
 	#[test]
@@ -1274,5 +1734,58 @@ mod tests {
 		let mut envelope = Item::new_from_element(Graphic::default());
 		stamp_effect(&mut envelope, invert);
 		assert!(matches!(paint_with_envelope_effects(envelope), Graphic::None(_)));
+	}
+
+	#[test]
+	fn a_mask_paints_nothing_past_the_content_but_its_feather_reads_past_it() {
+		let mask = EffectOperation::Mask {
+			mask: Graphic::Color(Item::new_from_element(Color::WHITE)),
+			mode: MaskMode::default(),
+			density: 100.,
+			feather: 4.,
+			invert: false,
+		};
+		assert_eq!(mask.painted_reach(), 0.);
+		assert_eq!(mask.working_reach(), 3. * mask_feather_sigma(4.));
+
+		let effects = Effects::from_operations([mask]);
+		assert_eq!((effects.reach(), effects.working_reach()), (0., 3. * mask_feather_sigma(4.)));
+	}
+
+	#[test]
+	fn baking_the_content_placement_into_its_geometry_keeps_its_mask_in_place() {
+		fn nested_placement(graphic: &Graphic) -> DAffine2 {
+			match graphic {
+				Graphic::Graphic(item) => item.attribute_cloned_or_default::<DAffine2>(ATTR_TRANSFORM) * nested_placement(item.element()),
+				_ => DAffine2::IDENTITY,
+			}
+		}
+		let masked_by = |mask: Graphic| {
+			Effects::from_operations([EffectOperation::Mask {
+				mask,
+				mode: MaskMode::default(),
+				density: 100.,
+				feather: 0.,
+				invert: false,
+			}])
+		};
+		let mask_of = |effects: &Effects| match effects.operations().next() {
+			Some(EffectOperation::Mask { mask, .. }) => mask,
+			_ => panic!("the row should stay a mask"),
+		};
+
+		// A mask drawn at (5, 7) beside content placed by `placement`, which then goes into the content's geometry, leaving it unplaced
+		let placement = DAffine2::from_scale_angle_translation(DVec2::splat(2.), 0.5, DVec2::new(200., 100.));
+		let drawn_at = DAffine2::from_translation(DVec2::new(5., 7.));
+		let mask = Graphic::Graphic(Box::new(Item::new_from_element(Graphic::default()).with_attribute(ATTR_TRANSFORM, drawn_at)));
+		let mut effects = masked_by(linked_to_content(mask, placement));
+		effects.rebase_stamped_transforms(placement);
+		assert!(nested_placement(&mask_of(&effects)).abs_diff_eq(drawn_at, 1e-9));
+
+		// A gradient without its own placement stretches across the content wherever it lies, so it's left as it is
+		let unplaced = Graphic::Gradient(Item::new_from_element(Gradient::default()));
+		let mut effects = masked_by(unplaced.clone());
+		effects.rebase_stamped_transforms(placement);
+		assert_eq!(mask_of(&effects), unplaced);
 	}
 }

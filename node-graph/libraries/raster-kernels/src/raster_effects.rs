@@ -2,27 +2,33 @@
 //! Each step mirrors the renderer's GPU passes, working on premultiplied gamma-encoded channels as they do.
 
 use crate::adjustments::adjust_colors;
-use crate::blending::overlay_paint;
+use crate::blending::blend_gamma;
 use crate::effect_kernels::{BlurKernel, NEGLIGIBLE_LENGTH, Plane};
 use crate::generators::pattern_sampler;
-use crate::value_effects::evaluate_gradient_effects;
+use crate::layer_blending::blend_layer;
+use crate::masks::{feather_strength, mask_strength, masked};
+use crate::value_effects::{adjustments, evaluate_gradient_effects, filled_color};
 use core_types::FallibleVec2Operations;
-use core_types::blending::{BlendMode, apply_blend_mode};
+use core_types::blending::BlendMode;
 use core_types::color::{linear_to_srgb, srgb_to_linear};
 use core_types::list::{ATTR_EFFECTS, ATTR_GRADIENT_FORM, Item};
 use core_types::transfer_curve::TransferCurve;
-use core_types::{ATTR_OPACITY, ATTR_OPACITY_FILL, ATTR_TRANSFORM, Color};
-use glam::{DAffine2, DMat2, DVec2, DVec3};
+use core_types::{ATTR_BLEND_MODE, ATTR_OPACITY, ATTR_OPACITY_FILL, ATTR_TRANSFORM, Color};
+use glam::{DAffine2, DMat2, DVec2};
 use graphic_types::Graphic;
 use graphic_types::adjustment::Adjustment;
+use graphic_types::effect_layers::{EffectLayers, LayerPart, PiecePlace};
 use graphic_types::effects::{
-	BevelDirection, BevelStyle, BevelTechnique, EffectOperation, Effects, GlowFill, GlowSource, GlowTechnique, bevel_light, bevel_lighting, effect_space, fitted_paint, grow_and_tent, outline_extents,
-	precise_falloff, shadow_offset, shape_strength, spans_along_axes,
+	BevelDirection, BevelStyle, BevelTechnique, EffectCapture, EffectOperation, Effects, GlowFill, GlowSource, GlowTechnique, OutlineFill, bevel_light, contour_gradient_span, effect_space,
+	fitted_paint, grow_and_tent, outline_extents, precise_falloff, shadow_offset, shape_strength, spans_along_axes,
 };
 use graphic_types::generator::GeneratorPattern;
 use raster_types::parallel_rows::fill_rows;
 use raster_types::{CPU, Image, Raster};
+use std::collections::HashMap;
 use vector_types::gradient::{Gradient, GradientForm, GradientSettings};
+
+mod styles;
 
 /// The most pixels an image may grow to with the margin its effects cast into, beyond which the margin is cut short.
 const MAX_PIXELS_WITH_MARGIN: f64 = (1 << 24) as f64;
@@ -62,8 +68,8 @@ pub fn adjusted_raster(raster: &Raster<CPU>, adjustments: &[Adjustment]) -> Rast
 	})
 }
 
-/// The image of the effects carried out on `raster`, which `transform` places in the document, with the transform placing that larger image.
-/// `None` when there's nothing to carry out, or the image is empty or its transform can't be inverted.
+/// The image of the `effects` carried out on `raster`, which `transform` places in the document, with the transform placing that larger image.
+/// Their layers are drawn over nothing, blending with each other by their modes. `None` when there's nothing to carry out, or the image is empty or its transform can't be inverted.
 fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: f32) -> Option<(Image<Color>, DAffine2)> {
 	let (width, height) = (raster.width as usize, raster.height as usize);
 	if (effects.change_nothing() && fill >= 1.) || width == 0 || height == 0 || transform.matrix2.determinant() == 0. {
@@ -73,25 +79,26 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 
 	// Each effect's lengths become pixels along each of the image's axes, and its offsets map from its effect space through the inverse of the image's pixel placement
 	let document_to_image_pixels = (transform.matrix2 * DMat2::from_diagonal(size.recip())).inverse();
-	let operations: Vec<(EffectOperation, DMat2, bool)> = (effects.runs().into_iter().enumerate())
+	let rows: Vec<(EffectOperation, DMat2, bool)> = (effects.runs().into_iter().enumerate())
 		.flat_map(|(run_index, (stamped_transform, rows))| {
 			let effect_to_pixels = document_to_image_pixels * effect_space(transform, stamped_transform).matrix2;
 			(effects.operations_in(rows).enumerate()).map(move |(index, operation)| (operation, effect_to_pixels, run_index > 0 && index == 0))
 		})
 		.collect();
 
-	// Unless a fill fades them first, leading adjustments change the image's own colors, keeping even transparent pixels' colors
-	let leading_adjustments = operations.iter().take_while(|_| fill == 1.).map_while(|(operation, ..)| match operation {
+	// Unless a fill fades them first, leading adjustments flattened into the image change its own colors, keeping even transparent pixels' colors
+	let layers = EffectLayers::plan_runs(effects, BlendMode::Normal, fill, true);
+	let leading_adjustments = rows.iter().take(layers.flattened).take_while(|_| fill == 1.).map_while(|(operation, ..)| match operation {
 		EffectOperation::Adjustment(adjustment) => Some(adjustment),
 		_ => None,
 	});
 	let mut colors = std::borrow::Cow::Borrowed(raster.data.as_slice());
-	let mut remaining = operations.as_slice();
+	let mut leading = 0;
 	for adjustment in leading_adjustments {
 		adjust_colors(adjustment, colors.to_mut());
-		remaining = &remaining[1..];
+		leading += 1;
 	}
-	if remaining.is_empty() {
+	if leading == rows.len() {
 		let data = colors.iter().map(|color| color.with_alpha(color.a() * fill)).collect();
 		return Some((
 			Image {
@@ -102,13 +109,16 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 			transform,
 		));
 	}
-	let operations = remaining;
 
 	// A margin around the image to hold the blur and shadows cast past its edges, cut short evenly for an image that would grow too large
-	let reach_in_pixels: DVec2 = (operations.iter())
+	let reach_in_pixels: DVec2 = (rows[leading..].iter())
 		.map(|(operation, effect_to_pixels, _)| operation.painted_reach() * spans_along_axes(*effect_to_pixels))
 		.sum();
 	let mut margin = reach_in_pixels.ceil();
+	// A feather needs the pixels past the image's edges, which are absent, to find those edges
+	if rows.iter().any(|(operation, ..)| matches!(operation, EffectOperation::Feather { distance } if *distance > 0.)) {
+		margin = margin.max(DVec2::ONE);
+	}
 	if (size + 2. * margin).element_product() > MAX_PIXELS_WITH_MARGIN {
 		let reach_in_pixels = margin.max_element();
 		margin = (margin * margin_fraction_that_fits(size, margin)).floor();
@@ -133,10 +143,14 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 	let mut filled = (fill < 1.).then(|| full.map(|pixel| pixel.map(|channel| channel * fill)));
 	// The shadows and glows stacked beneath the content
 	let mut beneath: Option<Plane<[f32; 4]>> = None;
+	// The layered effects' pieces, each tinted
+	let mut pieces: HashMap<EffectCapture, Plane<[f32; 4]>> = HashMap::new();
+	// How much the trailing masks together show of each finished layer
+	let mut layer_fade: Option<Plane<f32>> = None;
 
 	// Each run after the first takes the result of those before it as its content at full strength, like the renderers' nested runs
 	let mut run_fill = fill;
-	for &(ref operation, effect_to_pixels, starts_later_run) in operations {
+	for (index, &(ref operation, effect_to_pixels, starts_later_run)) in rows.iter().enumerate().skip(leading) {
 		if starts_later_run {
 			full = match (filled.take(), beneath.take()) {
 				(filled, Some(beneath)) => composite_beneath(filled.as_ref().unwrap_or(&full), &beneath),
@@ -145,7 +159,18 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 			};
 			run_fill = 1.;
 		}
+		if operation.changes_nothing() {
+			continue;
+		}
+		// TODO: Unlike the GPU and SVG, this ignores skew, and the distance-based effects (spread, choke, Precise, Outline, Bevel & Emboss, Feather) average the axes' scales.
+		// Delete this baking once its callers read back the GPU's renders, which are exact.
 		let pixels_per_length = spans_along_axes(effect_to_pixels);
+
+		// A layered effect's coverages become pieces, which the content knocks out once its layer is drawn, and a flattened one is knocked out by the faded content now
+		let layered = index >= layers.flattened;
+		let piece = |plane: usize| layered.then_some(EffectCapture { index, plane });
+		let knockout_fill = if layered { 1. } else { run_fill };
+
 		match *operation {
 			EffectOperation::Blur { radius, box_blur, gamma } => {
 				let radius = radius * pixels_per_length;
@@ -169,11 +194,14 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				size,
 				ref contour,
 				knockout,
+				..
 			} => {
 				let offset = effect_to_pixels * shadow_offset(angle, distance);
 				let silhouette = full.map(|[_, _, _, alpha]| alpha).shifted(offset.x, offset.y);
 				let strength = cast(silhouette, size, spread, GlowTechnique::Softer, 100., contour, pixels_per_length);
-				beneath = Some(accumulate(beneath, &strength, color, knockout, &full, run_fill));
+				let shadow = tinted(&strength, color);
+				let shadow = if knockout { knocked_out(shadow, &full, knockout_fill) } else { shadow };
+				place_beneath(&mut pieces, piece(0), &mut beneath, shadow);
 			}
 			EffectOperation::OuterGlow {
 				ref color,
@@ -182,14 +210,17 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				size,
 				range,
 				ref contour,
+				..
 			} => {
 				let Some(paint) = GlowFill::of(color) else { continue };
 				let raw = cast_strength(full.map(|[_, _, _, alpha]| alpha), size, spread, technique, pixels_per_length);
 				let strength = shaped(raw.clone(), range, contour);
-				beneath = Some(stack_beneath(beneath, glow_tint(&paint, &strength, &raw, true), true, &full, run_fill));
+				let glow = knocked_out(glow_tint(&paint, &strength, &raw, true), &full, knockout_fill);
+				place_beneath(&mut pieces, piece(0), &mut beneath, glow);
 			}
 			EffectOperation::InnerShadow {
 				color,
+				blend_mode,
 				angle,
 				distance,
 				choke,
@@ -200,11 +231,11 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				let offset = effect_to_pixels * shadow_offset(angle, distance);
 				let outside = full.map(|[_, _, _, alpha]| alpha).shifted(offset.x, offset.y).map(|alpha| 1. - alpha);
 				let strength = cast(outside, size, choke, GlowTechnique::Softer, 100., contour, pixels_per_length);
-				filled = filled.map(|filled| composite_within(&filled, &strength, &full, color));
-				full = composite_within(&full, &strength, &full, color);
+				place_within(&mut pieces, piece(0), &mut full, &mut filled, tinted(&strength, color), blend_mode);
 			}
 			EffectOperation::InnerGlow {
 				ref color,
+				blend_mode,
 				technique,
 				source,
 				choke,
@@ -222,12 +253,15 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				}
 
 				// An inner glow doesn't fade, since the content bounds it
-				let tinted = glow_tint(&paint, &strength, &strength, false);
-				filled = filled.map(|filled| composite_tinted_within(&filled, &tinted, &full));
-				full = composite_tinted_within(&full, &tinted, &full);
+				let glow = match paint {
+					GlowFill::Solid(color) => tinted(&strength, color),
+					GlowFill::Gradient { .. } => glow_tint(&paint, &strength, &strength, false),
+				};
+				place_within(&mut pieces, piece(0), &mut full, &mut filled, glow, blend_mode);
 			}
 			EffectOperation::Satin {
 				color,
+				blend_mode,
 				angle,
 				distance,
 				size,
@@ -251,23 +285,57 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				let difference = cast_toward(offset).zip(&cast_toward(-offset), |forward, backward| (forward - backward).abs());
 
 				let strength = shaped(if invert { difference.map(|difference| 1. - difference) } else { difference }, 100., contour);
-				filled = filled.map(|filled| composite_within(&filled, &strength, &full, color));
-				full = composite_within(&full, &strength, &full, color);
+				place_within(&mut pieces, piece(0), &mut full, &mut filled, tinted(&strength, color), blend_mode);
 			}
-			EffectOperation::Outline { color, weight, align } => {
+			EffectOperation::Outline {
+				ref paint,
+				blend_mode,
+				weight,
+				align,
+				contour_gradient,
+			} => {
+				let Some(outline_fill) = OutlineFill::of(paint, contour_gradient) else { continue };
+
 				// Straight-line distances can't stretch along one axis, so an image scaled unevenly takes the mean of its two scales
 				let mean_scale = (pixels_per_length.x * pixels_per_length.y).sqrt();
 				let (outside, inside) = outline_extents(weight * mean_scale, align);
-				let silhouette = full.map(|[_, _, _, alpha]| alpha);
+				let contour_span = matches!(outline_fill, OutlineFill::ContourGradient(_))
+					.then(|| contour_gradient_span(weight, align))
+					.map(|(start, span)| (start * mean_scale, span * mean_scale));
+				let bands = styles::outline_bands(&full.map(|[_, _, _, alpha]| alpha), outside, inside, contour_span);
+
+				// The premultiplied colors the bands take before their coverage, unless a solid color tints them
+				let colors = match &outline_fill {
+					OutlineFill::Solid(_) => None,
+					OutlineFill::Drawn(_) => {
+						// TODO: A paint the CPU can't draw leaves the outline out (see `drawn_paint_colors`)
+						let Some(colors) = drawn_paint_colors(operation, transform, size, effect_to_pixels, (margin_x, margin_y), full.width, full.height) else {
+							continue;
+						};
+						Some(Plane {
+							width: full.width,
+							height: full.height,
+							data: colors.into_iter().map(premultiplied_gamma_channels).collect(),
+						})
+					}
+					OutlineFill::ContourGradient(gradient) => {
+						let Some(positions) = &bands.positions else { continue };
+						Some(styles::contour_gradient_colors(gradient, positions))
+					}
+				};
+				let painted = |coverage: &Plane<f32>| match (&outline_fill, &colors) {
+					(OutlineFill::Solid(color), _) => tinted(coverage, *color),
+					(_, Some(colors)) => coverage.zip(colors, |coverage, color| color.map(|channel| channel * coverage)),
+					(_, None) => coverage.map(|_| [0.; 4]),
+				};
 
 				// The band outside lies beneath the content like a shadow, and the band inside over it like an inner shadow
-				if outside >= NEGLIGIBLE_LENGTH {
-					beneath = Some(accumulate(beneath, &silhouette.grown(outside), color, true, &full, run_fill));
+				if let Some(band) = &bands.outside {
+					let band = knocked_out(painted(band), &full, knockout_fill);
+					place_beneath(&mut pieces, piece(0), &mut beneath, band);
 				}
-				if inside >= NEGLIGIBLE_LENGTH {
-					let band = silhouette.map(|alpha| 1. - alpha).grown(inside);
-					filled = filled.map(|filled| composite_within(&filled, &band, &full, color));
-					full = composite_within(&full, &band, &full, color);
+				if let Some(band) = &bands.inside {
+					place_within(&mut pieces, piece(1), &mut full, &mut filled, painted(band), blend_mode);
 				}
 			}
 			EffectOperation::BevelAndEmboss {
@@ -283,18 +351,44 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				highlight_blend_mode,
 				shadow_color,
 				shadow_blend_mode,
+				ref gloss_contour,
+				gloss_antialiased,
+				ref slope_contour,
+				slope_antialiased,
+				slope_range,
+				texture_depth,
+				..
 			} => {
 				// Straight-line distances can't stretch along one axis, so an image scaled unevenly takes the mean of its two scales
 				let mean_scale = (pixels_per_length.x * pixels_per_length.y).sqrt();
-				let size = size * mean_scale;
-				if size < NEGLIGIBLE_LENGTH {
+				let bevel_size = size * mean_scale;
+				if bevel_size < NEGLIGIBLE_LENGTH && gloss_contour.is_identity() {
 					continue;
 				}
+				let image_size = DVec2::new(width as f64, height as f64);
+				// TODO: A texture the CPU can't draw leaves the surface untextured (see `drawn_paint_colors`)
+				let texture = drawn_paint_colors(operation, transform, image_size, effect_to_pixels, (margin_x, margin_y), full.width, full.height)
+					.map(|colors| styles::texture_grays(colors, full.width, full.height));
 
-				// The surface's height, lit from the light's direction into its highlights and shadows
-				let (height, rise) = bevel_height(&full.map(|[_, _, _, alpha]| alpha), style, technique, size);
+				// The surface's height, reshaped by the contour and sunk by the texture, lit from the light's direction into its highlights and shadows
+				let (height, rise) = bevel_height(&full.map(|[_, _, _, alpha]| alpha), style, technique, bevel_size);
 				let rise = rise * depth / 100. * if direction == BevelDirection::Down { -1. } else { 1. };
-				let lit = bevel_shading(&height, rise, bevel_light(angle, altitude, effect_to_pixels));
+				let surface = styles::BevelSurface {
+					style,
+					slope_contour,
+					slope_range,
+					slope_antialiased,
+					texture,
+					texture_depth,
+				};
+				let gloss = (!gloss_contour.is_identity()).then(|| (gloss_contour.evaluator(), gloss_antialiased));
+				let light = bevel_light(angle, altitude, effect_to_pixels);
+				let bevel_shading = |rise: f64| styles::bevel_shading(&height, &surface, rise, light, gloss.as_ref());
+				let lit = bevel_shading(rise);
+
+				// Under a gloss contour or texture, the shading beneath the content fades out across the slopes' foot
+				let fades_at_foot = gloss.is_some() || surface.texture.is_some();
+				let beneath_shading = |amounts: [Plane<f32>; 2]| if fades_at_foot { styles::foot_faded(amounts, &height) } else { amounts };
 				let (_, soften) = grow_and_tent(soften * mean_scale, 0.);
 				let softened = |amounts: [Plane<f32>; 2]| {
 					amounts.map(|amount| match soften >= NEGLIGIBLE_LENGTH {
@@ -307,37 +401,83 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 				let inside = (style != BevelStyle::OuterBevel).then(|| softened(lit.clone()));
 				let outside = match style {
 					BevelStyle::InnerBevel => None,
-					BevelStyle::OuterBevel | BevelStyle::Emboss => Some(inside.clone().unwrap_or_else(|| softened(lit))),
+					BevelStyle::OuterBevel | BevelStyle::Emboss => Some(match (&inside, fades_at_foot) {
+						(Some(inside), false) => inside.clone(),
+						_ => softened(beneath_shading(lit)),
+					}),
 					// A pillow's slopes outside are lit mirrored, so they rise away from the edge
-					BevelStyle::PillowEmboss => Some(softened(bevel_shading(&height, -rise, bevel_light(angle, altitude, effect_to_pixels)))),
+					BevelStyle::PillowEmboss => Some(softened(beneath_shading(bevel_shading(-rise)))),
 				};
 				let colors = [(highlight_color, highlight_blend_mode), (shadow_color, shadow_blend_mode)];
-				for (amount, (color, blend_mode)) in inside.into_iter().flatten().zip(colors) {
-					filled = filled.map(|filled| composite_within_by_mode(&filled, &amount, &full, color, blend_mode));
-					full = composite_within_by_mode(&full, &amount, &full, color, blend_mode);
+				for (plane, (amount, (color, blend_mode))) in inside.into_iter().flatten().zip(colors).enumerate() {
+					place_within(&mut pieces, piece(plane), &mut full, &mut filled, tinted(&amount, color), blend_mode);
 				}
-				for (amount, (color, _)) in outside.into_iter().flatten().zip(colors) {
-					beneath = Some(accumulate(beneath, &amount, color, true, &full, run_fill));
+				for (plane, (amount, (color, _))) in outside.into_iter().flatten().zip(colors).enumerate() {
+					let slope = knocked_out(tinted(&amount, color), &full, knockout_fill);
+					place_beneath(&mut pieces, piece(plane + 2), &mut beneath, slope);
 				}
 			}
-			EffectOperation::PaintOverlay { ref paint, blend_mode, opacity } => {
-				let corners = [DVec2::ZERO, DVec2::X, DVec2::Y, DVec2::ONE].map(|corner| transform.transform_point2(corner));
-				let content_bounds = [corners.into_iter().reduce(DVec2::min).unwrap(), corners.into_iter().reduce(DVec2::max).unwrap()];
-				let fitted = fitted_paint(paint, content_bounds);
-				let Some(sample_paint) = paint_sampler(fitted.as_ref().unwrap_or(paint)) else { continue };
-
-				// The paint at each pixel's center, in the space the image is placed in
-				let pixels_to_placement = transform * DAffine2::from_scale(size.recip()) * DAffine2::from_translation(-DVec2::new(margin_x as f64, margin_y as f64));
-				let mut paint_colors = vec![Color::TRANSPARENT; full.data.len()];
-				fill_rows(&mut paint_colors, full.width, |y, row| {
-					for (x, color) in row.iter_mut().enumerate() {
-						*color = sample_paint(pixels_to_placement.transform_point2(DVec2::new(x as f64 + 0.5, y as f64 + 0.5)));
-					}
-				});
+			EffectOperation::PaintOverlay { blend_mode, opacity, .. } => {
+				// TODO: A paint the CPU can't draw leaves the overlay out (see `drawn_paint_colors`)
+				let Some(paint_colors) = drawn_paint_colors(operation, transform, size, effect_to_pixels, (margin_x, margin_y), full.width, full.height) else {
+					continue;
+				};
 
 				let opacity = (opacity / 100.) as f32;
-				filled = filled.map(|filled| overlay(&filled, &paint_colors, blend_mode, opacity));
-				full = overlay(&full, &paint_colors, blend_mode, opacity);
+				let data = paint_colors.iter().map(|&paint| premultiplied_gamma_channels(paint).map(|channel| channel * opacity)).collect();
+				let painted = Plane {
+					width: full.width,
+					height: full.height,
+					data,
+				};
+				place_within(&mut pieces, piece(0), &mut full, &mut filled, painted, blend_mode);
+			}
+			// A solid paint overlay paints within the content alone, like any other paint overlay
+			EffectOperation::Adjustment(Adjustment::ColorOverlay { color, blend_mode, opacity }) => {
+				let painted = premultiplied_gamma_channels(color.with_alpha(color.a() * (opacity / 100.) as f32));
+				let painted = full.map(|_| painted);
+				place_within(&mut pieces, piece(0), &mut full, &mut filled, painted, blend_mode);
+			}
+			EffectOperation::Mask { mode, density, feather, invert, .. } => {
+				// The mask graphic is read as far past the image as its feather reaches, which paints nothing there, cut short like the image's own margin
+				let read_margin = (operation.reach() * pixels_per_length).ceil();
+				let read_margin = (read_margin * margin_fraction_that_fits(DVec2::new(full.width as f64, full.height as f64), read_margin)).floor();
+				let (read_x, read_y) = (read_margin.x as usize, read_margin.y as usize);
+				let (read_width, read_height) = (full.width + 2 * read_x, full.height + 2 * read_y);
+
+				// TODO: A mask graphic the CPU can't draw, like a vector shape, leaves the content unmasked (see `drawn_paint_colors`)
+				let Some(mask_colors) = drawn_paint_colors(operation, transform, size, effect_to_pixels, (margin_x + read_x, margin_y + read_y), read_width, read_height) else {
+					continue;
+				};
+				let strength = mask_strength(&mask_colors, read_width, read_height, mode, density, feather, invert, pixels_per_length);
+				let strength = Plane {
+					width: full.width,
+					height: full.height,
+					data: (0..full.height)
+						.flat_map(|y| strength.data[(y + read_y) * read_width + read_x..][..full.width].iter().copied())
+						.collect(),
+				};
+
+				if layers.trailing_masks.contains(&index) {
+					layer_fade = Some(match layer_fade.take() {
+						Some(fade) => fade.zip(&strength, |fade, strength| fade * strength),
+						None => strength,
+					});
+					continue;
+				}
+
+				merge_beneath(&mut full, &mut filled, &mut beneath);
+				full = masked(&full, &strength);
+				filled = filled.map(|filled| masked(&filled, &strength));
+			}
+			EffectOperation::Feather { distance } => {
+				merge_beneath(&mut full, &mut filled, &mut beneath);
+
+				// Distances run in the image's pixels, so an image scaled unevenly takes the mean of its two scales, as an outline does
+				let mean_scale = (pixels_per_length.x * pixels_per_length.y).sqrt();
+				let strength = feather_strength(&full, distance * mean_scale);
+				full = masked(&full, &strength);
+				filled = filled.map(|filled| masked(&filled, &strength));
 			}
 			EffectOperation::Adjustment(ref adjustment) => {
 				merge_beneath(&mut full, &mut filled, &mut beneath);
@@ -347,11 +487,7 @@ fn evaluate(raster: &Raster<CPU>, transform: DAffine2, effects: &Effects, fill: 
 		}
 	}
 
-	let result = match (filled, beneath) {
-		(filled, Some(beneath)) => composite_beneath(filled.as_ref().unwrap_or(&full), &beneath),
-		(Some(filled), None) => filled,
-		(None, None) => full,
-	};
+	let result = composite_layers(&layers, filled.as_ref().unwrap_or(&full), beneath.as_ref(), &full, &pieces, layer_fade.as_ref());
 	let image = Image {
 		width: result.width as u32,
 		height: result.height as u32,
@@ -383,7 +519,7 @@ fn margin_fraction_that_fits(size: DVec2, margin: DVec2) -> f64 {
 }
 
 /// A color as the premultiplied, gamma-encoded channels the effects work with.
-fn premultiplied_gamma_channels(color: Color) -> [f32; 4] {
+pub(crate) fn premultiplied_gamma_channels(color: Color) -> [f32; 4] {
 	let [red, green, blue, alpha] = color.to_gamma_srgb_channels();
 	[red * alpha, green * alpha, blue * alpha, alpha]
 }
@@ -503,44 +639,216 @@ fn glow_tint(paint: &GlowFill, strength: &Plane<f32>, raw: &Plane<f32>, fades: b
 		.map(|[strength, raw, ..]| premultiplied_gamma_channels(paint.color_at(strength as f64, raw as f64, fades)))
 }
 
-/// Stacks a silhouette's coverage, tinted `color`, over what lies `beneath` the content so far.
-/// If `knocked_out`, it stays hidden behind the full-strength content where a `fill` below 1 fades the content that shows over it.
-fn accumulate(beneath: Option<Plane<[f32; 4]>>, coverage: &Plane<f32>, color: Color, knocked_out: bool, full_content: &Plane<[f32; 4]>, fill: f32) -> Plane<[f32; 4]> {
+/// A silhouette's coverage tinted `color`.
+fn tinted(coverage: &Plane<f32>, color: Color) -> Plane<[f32; 4]> {
 	let color = premultiplied_gamma_channels(color);
-	stack_beneath(beneath, coverage.map(|coverage| color.map(|channel| channel * coverage)), knocked_out, full_content, fill)
+	coverage.map(|coverage| color.map(|channel| channel * coverage))
 }
 
-/// Stacks a premultiplied `tinted` image over what lies `beneath` the content so far, knocked out like [`accumulate`] describes.
-fn stack_beneath(beneath: Option<Plane<[f32; 4]>>, tinted: Plane<[f32; 4]>, knocked_out: bool, full_content: &Plane<[f32; 4]>, fill: f32) -> Plane<[f32; 4]> {
-	let tinted = match knocked_out && fill < 1. {
-		// The faded content shows what's beneath through 1 - fill × alpha of it, of which only 1 - alpha may show this
-		true => tinted.zip(full_content, |tinted, content| {
-			let shown = (1. - content[3]) / (1. - fill * content[3]).max(f32::EPSILON);
-			tinted.map(|channel| channel * shown)
-		}),
-		false => tinted,
-	};
+/// A tinted image of what lies beneath, hidden behind the full-strength content where the content covers it as strongly as `fill`.
+fn knocked_out(tinted: Plane<[f32; 4]>, full_content: &Plane<[f32; 4]>, fill: f32) -> Plane<[f32; 4]> {
+	if fill >= 1. {
+		return tinted;
+	}
 
-	match beneath {
-		Some(beneath) => tinted.zip(&beneath, |tinted, beneath| std::array::from_fn(|channel| tinted[channel] + beneath[channel] * (1. - tinted[3]))),
-		None => tinted,
+	// The faded content shows what's beneath through 1 - fill × alpha of it, of which only 1 - alpha may show this
+	tinted.zip(full_content, |tinted, content| {
+		let shown = (1. - content[3]) / (1. - fill * content[3]).max(f32::EPSILON);
+		tinted.map(|channel| channel * shown)
+	})
+}
+
+/// Places a tinted image beneath the content: as the layered `piece` if it names one, or else stacked over what lies `beneath` the content so far.
+fn place_beneath(pieces: &mut HashMap<EffectCapture, Plane<[f32; 4]>>, piece: Option<EffectCapture>, beneath: &mut Option<Plane<[f32; 4]>>, tinted: Plane<[f32; 4]>) {
+	match piece {
+		Some(piece) => {
+			pieces.insert(piece, tinted);
+		}
+		None => *beneath = Some(stack_over(beneath.take(), tinted)),
 	}
 }
 
-/// The image with a silhouette's coverage, tinted `color`, placed over it within the full-strength content.
-fn composite_within(image: &Plane<[f32; 4]>, coverage: &Plane<f32>, full_content: &Plane<[f32; 4]>, color: Color) -> Plane<[f32; 4]> {
-	let color = premultiplied_gamma_channels(color);
-	composite_tinted_within(image, &coverage.map(|coverage| color.map(|channel| channel * coverage)), full_content)
+/// Places a premultiplied `tinted` image within the content: as the layered `piece` if it names one, or else over the content's images, mixed with its colors by the blend mode.
+fn place_within(
+	pieces: &mut HashMap<EffectCapture, Plane<[f32; 4]>>,
+	piece: Option<EffectCapture>,
+	full: &mut Plane<[f32; 4]>,
+	filled: &mut Option<Plane<[f32; 4]>>,
+	tinted: Plane<[f32; 4]>,
+	blend_mode: BlendMode,
+) {
+	match piece {
+		Some(piece) => {
+			pieces.insert(piece, tinted);
+		}
+		None => {
+			*filled = filled.take().map(|filled| composite_in_share(&filled, &tinted, full, blend_mode, SharePart::Whole));
+			*full = composite_in_share(full, &tinted, full, blend_mode, SharePart::Whole);
+		}
+	}
 }
 
-/// The image with a premultiplied `tinted` image placed over it within the full-strength content.
-fn composite_tinted_within(image: &Plane<[f32; 4]>, tinted: &Plane<[f32; 4]>, full_content: &Plane<[f32; 4]>) -> Plane<[f32; 4]> {
-	let uncovered = image.zip(tinted, |image, tinted| image.map(|channel| channel * (1. - tinted[3])));
-	let within = tinted.zip(full_content, |tinted, content| tinted.map(|channel| channel * content[3]));
-	uncovered.zip(&within, |uncovered, within| std::array::from_fn(|channel| uncovered[channel] + within[channel]))
+/// The `upper` image stacked over the `stack`, if there is one.
+fn stack_over(stack: Option<Plane<[f32; 4]>>, upper: Plane<[f32; 4]>) -> Plane<[f32; 4]> {
+	match stack {
+		Some(stack) => composite_beneath(&upper, &stack),
+		None => upper,
+	}
 }
 
-/// Places what lies `beneath` under the full-strength content and the faded fill, so a pixel filter after it (a blur or an adjustment) processes them together.
+/// The `layers` drawn over nothing, from the content's image with its flattened effects, the shadows and glows flattened `beneath` it, and the layered `pieces`.
+/// The content's layer is finished first, since the knockouts and the parts showing through its fill read its alpha.
+/// Each layer then stacks its parts, fades by the trailing masks' `fade` if there is one, and blends by its mode onto the layers before it.
+fn composite_layers(
+	layers: &EffectLayers,
+	content_image: &Plane<[f32; 4]>,
+	beneath: Option<&Plane<[f32; 4]>>,
+	full_content: &Plane<[f32; 4]>,
+	pieces: &HashMap<EffectCapture, Plane<[f32; 4]>>,
+	fade: Option<&Plane<f32>>,
+) -> Plane<[f32; 4]> {
+	// Drawn over nothing, the item's opacity applies afterward to the whole image
+	const OPACITY: f32 = 1.;
+
+	let content_layer = layers.content_layer();
+	let mut content = content_image.clone();
+	for piece in content_layer.into_iter().flat_map(|layer| &layers.layers[layer].parts).filter_map(|part| match part {
+		LayerPart::Piece(piece) => Some(piece),
+		LayerPart::Content => None,
+	}) {
+		let Some(tinted) = pieces.get(&piece.capture) else { continue };
+		let part = match piece.place {
+			PiecePlace::Within => SharePart::Whole,
+			PiecePlace::IntoContent { over: false } => SharePart::IntoContent,
+			PiecePlace::IntoContent { over: true } => SharePart::IntoContentBeneathPartOver { opacity: OPACITY, fade },
+			PiecePlace::Beneath | PiecePlace::Through { .. } => continue,
+		};
+		content = composite_in_share(&content, tinted, full_content, piece.blend_mode, part);
+	}
+
+	let mut result: Option<Plane<[f32; 4]>> = None;
+	for (index, layer) in layers.layers.iter().enumerate() {
+		let holds_content = Some(index) == content_layer;
+		let mut stack = beneath.filter(|_| holds_content).cloned();
+
+		for part in &layer.parts {
+			let LayerPart::Piece(piece) = part else { continue };
+			let Some(tinted) = pieces.get(&piece.capture) else { continue };
+
+			let upper = match piece.place {
+				PiecePlace::Beneath if piece.knocks_out => {
+					let cover_fade = fade.filter(|_| layers.masks_fade_knockout_cover(piece.capture));
+					knocked_out_by_layer(tinted, full_content, &content, layers.knockout_cover(piece.capture, OPACITY), cover_fade)
+				}
+				PiecePlace::Beneath => tinted.clone(),
+				PiecePlace::Within if !holds_content => tinted.zip(full_content, |tinted, content| tinted.map(|channel| channel * content[3])),
+				PiecePlace::Through { .. } => tinted.zip(&through_shares(full_content, &content, OPACITY, fade), |tinted, share| tinted.map(|channel| channel * share)),
+				PiecePlace::Within | PiecePlace::IntoContent { .. } => continue,
+			};
+			stack = Some(stack_over(stack, upper));
+		}
+
+		let image = if holds_content { Some(stack_over(stack.take(), content.clone())) } else { stack };
+		let Some(image) = image else { continue };
+		let image = match fade {
+			Some(fade) => masked(&image, fade),
+			None => image,
+		};
+		result = Some(match result {
+			Some(below) => blend_layer(&image, &below, layer.blend_mode),
+			None => image,
+		});
+	}
+
+	result.unwrap_or(content)
+}
+
+/// How a part of an interior piece composites within the content's share of each pixel.
+#[derive(Clone, Copy)]
+enum SharePart<'a> {
+	/// The whole piece, blending with the content's colors as far as they show and painting plainly where the fill lets nothing show.
+	Whole,
+	/// The part blending with the content's colors, which leaves the content's alpha as it is.
+	IntoContent,
+	/// That part for a piece whose part over the content takes the share through its fill, at the `opacity` the `fade` leaves, leaving this the rest.
+	IntoContentBeneathPartOver { opacity: f32, fade: Option<&'a Plane<f32>> },
+}
+
+/// The image with a premultiplied `tinted` part of an interior piece composited within the full-strength content's share of each pixel, mixed with the image's own colors by the blend mode in gamma.
+/// For PSD interop, interior pieces stack inside the share as layers over nothing would, and the share then scales the stack. O(width × height).
+fn composite_in_share(image: &Plane<[f32; 4]>, tinted: &Plane<[f32; 4]>, full_content: &Plane<[f32; 4]>, blend_mode: BlendMode, part: SharePart) -> Plane<[f32; 4]> {
+	let mut result = Plane::<[f32; 4]>::new(image.width, image.height);
+	fill_rows(&mut result.data, image.width, |y, row| {
+		for (x, composited) in row.iter_mut().enumerate() {
+			let index = y * image.width + x;
+			let (pixel, paint, share) = (image.data[index], tinted.data[index], full_content.data[index][3]);
+			let (strength, alpha) = (paint[3], pixel[3]);
+			if strength <= 0. {
+				*composited = pixel;
+				continue;
+			}
+
+			// The paint blended with the image's own straight color, weighted by how much of the share the image covers
+			let color = [0, 1, 2].map(|channel| paint[channel] / strength);
+			let blended = match alpha > 0. {
+				true => blend_gamma([0, 1, 2].map(|channel| pixel[channel] / alpha), color, blend_mode).map(|channel| channel * alpha),
+				false => [0.; 3],
+			};
+
+			let (strength, plain) = match part {
+				SharePart::Whole => (strength, share - alpha),
+				SharePart::IntoContent => (strength, 0.),
+				SharePart::IntoContentBeneathPartOver { opacity, fade } => {
+					let opacity = faded_opacity(opacity, fade, index);
+					(strength * (1. - opacity * through_share(share, alpha, opacity)), 0.)
+				}
+			};
+			let [red, green, blue] = std::array::from_fn(|channel| (1. - strength) * pixel[channel] + strength * (plain * color[channel] + blended[channel]));
+			*composited = [red, green, blue, alpha + strength * plain];
+		}
+	});
+	result
+}
+
+/// The share of a pixel within the content of full-strength alpha `share` that what lies beneath shows through, given the content's layer's alpha, drawn at `opacity`.
+fn through_share(share: f32, layer_alpha: f32, opacity: f32) -> f32 {
+	let shown = 1. - opacity * layer_alpha;
+	if shown > f32::EPSILON { ((share - layer_alpha) / shown).clamp(0., 1.) } else { 0. }
+}
+
+/// The `opacity` that the trailing masks' `fade` leaves at the pixel at `index`.
+fn faded_opacity(opacity: f32, fade: Option<&Plane<f32>>, index: usize) -> f32 {
+	opacity * fade.map_or(1., |fade| fade.data[index])
+}
+
+/// The share [`through_share`] gives at each pixel of the content and its finished layer, by [`faded_opacity`].
+fn through_shares(full_content: &Plane<[f32; 4]>, content_layer: &Plane<[f32; 4]>, opacity: f32, fade: Option<&Plane<f32>>) -> Plane<f32> {
+	let mut shares = Plane::<f32>::new(full_content.width, full_content.height);
+	fill_rows(&mut shares.data, full_content.width, |y, row| {
+		for (x, share) in row.iter_mut().enumerate() {
+			let index = y * full_content.width + x;
+			*share = through_share(full_content.data[index][3], content_layer.data[index][3], faded_opacity(opacity, fade, index));
+		}
+	});
+	shares
+}
+
+/// A tinted image of what lies beneath, hidden behind the full-strength content where its finished layer covers it, at the faded `cover` times its alpha.
+fn knocked_out_by_layer(tinted: &Plane<[f32; 4]>, full_content: &Plane<[f32; 4]>, content_layer: &Plane<[f32; 4]>, cover: f32, fade: Option<&Plane<f32>>) -> Plane<[f32; 4]> {
+	let mut knocked_out = Plane::<[f32; 4]>::new(tinted.width, tinted.height);
+	fill_rows(&mut knocked_out.data, tinted.width, |y, row| {
+		for (x, pixel) in row.iter_mut().enumerate() {
+			let index = y * tinted.width + x;
+			let covered = faded_opacity(cover, fade, index) * content_layer.data[index][3];
+			let shown = ((1. - full_content.data[index][3]) / (1. - covered).max(f32::EPSILON)).min(1.);
+
+			*pixel = tinted.data[index].map(|channel| channel * shown);
+		}
+	});
+	knocked_out
+}
+
+/// Places what lies `beneath` under the full-strength content and the faded fill, so a pixel filter after it (a blur, an adjustment, a mask, or a feather) processes them together.
 fn merge_beneath(full: &mut Plane<[f32; 4]>, filled: &mut Option<Plane<[f32; 4]>>, beneath: &mut Option<Plane<[f32; 4]>>) {
 	let Some(beneath) = beneath.take() else { return };
 
@@ -553,8 +861,8 @@ fn composite_beneath(image: &Plane<[f32; 4]>, beneath: &Plane<[f32; 4]>) -> Plan
 	image.zip(beneath, |image, beneath| std::array::from_fn(|channel| image[channel] + beneath[channel] * (1. - image[3])))
 }
 
-/// A bevel's height from 0 to 1 over the `style`'s slopes `size` pixels wide, shaped by the `technique`, with how many pixels a height of 1 rises.
-/// Smooth slopes are a tent blur of the silhouette, and chiseled ones rise evenly with the distance from its edge.
+/// A bevel's height over the `style`'s slopes `size` pixels wide, shaped by the `technique`, from -0.5 at their foot to 0.5 at their top, with how many pixels they rise.
+/// It's centered on the edge, where the GPU's matching half floats are finest. Smooth slopes are a tent blur of the silhouette, and chiseled ones rise evenly with the distance from its edge.
 fn bevel_height(silhouette: &Plane<f32>, style: BevelStyle, technique: BevelTechnique, size: f64) -> (Plane<f32>, f64) {
 	// Embossed slopes span half the size on each side of the edge
 	let span = match style {
@@ -562,14 +870,19 @@ fn bevel_height(silhouette: &Plane<f32>, style: BevelStyle, technique: BevelTech
 		BevelStyle::Emboss | BevelStyle::PillowEmboss => size / 2.,
 	};
 
+	// Slopes too narrow to see leave a flat surface, of the coverage less a half, which only a gloss contour shades
+	if span < NEGLIGIBLE_LENGTH {
+		return (silhouette.map(|alpha| alpha - 0.5), 0.);
+	}
+
 	match technique {
 		BevelTechnique::Smooth => {
 			let (_, tent) = grow_and_tent(span, 0.);
-			(silhouette.clone().blurred(BlurKernel::Tent { radius: tent }, BlurKernel::Tent { radius: tent }), span)
+			(silhouette.map(|alpha| alpha - 0.5).blurred(BlurKernel::Tent { radius: tent }, BlurKernel::Tent { radius: tent }), span)
 		}
 		BevelTechnique::ChiselHard | BevelTechnique::ChiselSoft => {
 			// For PSD interop, the slope continues through the edge from 0 at the first pixel outside, and levels off a pixel past its span having risen half the span.
-			// The height spans only the part across the edge the style lights, which keeps its precision.
+			// The height spans only the part across the edge the style lights.
 			let near = if technique == BevelTechnique::ChiselSoft { 3. } else { 2. };
 			let (low, high) = match style {
 				BevelStyle::InnerBevel => (-near, span + 1.),
@@ -593,109 +906,70 @@ fn bevel_height(silhouette: &Plane<f32>, style: BevelStyle, technique: BevelTech
 				}
 			};
 
-			let (low, high) = (low as f32, high as f32);
-			let height = field.map(|field| (field.clamp(low, high) - low) / (high - low));
-			(height, span / (2. * (span + 1.)) * (high - low) as f64)
+			// The slopes run from their foot a pixel past their span outside to their top a pixel past it inside
+			let (low, high, reach) = (low as f32, high as f32, (span + 1.) as f32);
+			let height = field.map(|field| field.clamp(low, high) / (2. * reach));
+			(height, span)
 		}
 	}
 }
 
-/// How much each pixel of a bevel's surface is lit by the `light` past a flat surface's brightness (its highlight), and how much it falls short (its shadow), each from 0 to 1.
-/// The surface's height rises `rise` pixels for each unit of `height`, and for PSD interop, its slope at each pixel is the difference across its neighbors averaged over the three rows or columns they span. O(width × height).
-fn bevel_shading(height: &Plane<f32>, rise: f64, light: DVec3) -> [Plane<f32>; 2] {
-	let (columns, rows) = (height.width as isize, height.height as isize);
-	let at = |x: isize, y: isize| height.data[(y.clamp(0, rows - 1) * columns + x.clamp(0, columns - 1)) as usize] as f64;
+/// The color of the operation's drawn paint at each pixel's center in an image `width` by `height`, which is the image of `size` pixels that `transform` places grown by `margin` on each side.
+/// A paint without its own placement is fitted to the bounds [`EffectOperation::drawn_paint_bounds`] gives, whose lengths `effect_to_pixels` maps, and one following the content is placed with it.
+/// `None` if the operation has no paint the CPU can draw.
+#[allow(clippy::too_many_arguments)]
+fn drawn_paint_colors(operation: &EffectOperation, transform: DAffine2, size: DVec2, effect_to_pixels: DMat2, (margin_x, margin_y): (usize, usize), width: usize, height: usize) -> Option<Vec<Color>> {
+	let paint = operation.drawn_paint()?;
+	let corners = [DVec2::ZERO, DVec2::X, DVec2::Y, DVec2::ONE].map(|corner| transform.transform_point2(corner));
+	let content_bounds = [corners.into_iter().reduce(DVec2::min)?, corners.into_iter().reduce(DVec2::max)?];
+	let length_spans = spans_along_axes(transform.matrix2 * DMat2::from_diagonal(size.recip()) * effect_to_pixels);
+	let fitted = fitted_paint(paint, operation.drawn_paint_bounds(content_bounds, length_spans));
+	let placement = match fitted.is_none() && operation.drawn_paint_follows_content() {
+		true => transform,
+		false => DAffine2::IDENTITY,
+	};
+	if !placement.matrix2.determinant().is_normal() {
+		return None;
+	}
+	// TODO: The CPU can't draw vector, text, GPU image, or effected group paints, so pixel-reading nodes get their content unmasked, unpainted, or untextured.
+	// Fix by porting this baking's callers to read Vello's renders back to the CPU, then deleting this baking.
+	let Some(sample_paint) = paint_sampler(fitted.as_ref().unwrap_or(paint)) else {
+		log::warn!("An effect's paint is left out of the pixels, since only the renderers can draw a graphic of its kind");
+		return None;
+	};
 
-	let mut lighting = Plane::<[f32; 4]>::new(height.width, height.height);
-	fill_rows(&mut lighting.data, height.width, |y, row| {
-		let y = y as isize;
-		for (x, lit) in row.iter_mut().enumerate() {
-			let x = x as isize;
-			let across = at(x + 1, y - 1) + at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - at(x - 1, y) - at(x - 1, y + 1);
-			let down = at(x - 1, y + 1) + at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - at(x, y - 1) - at(x + 1, y - 1);
-
-			let (highlight, shadow) = bevel_lighting(DVec2::new(across, down) * rise / 6., light);
-			*lit = [highlight as f32, shadow as f32, 0., 0.];
+	// The paint at each pixel's center, in the space the paint is placed in
+	let pixels_to_placement = placement.inverse() * transform * DAffine2::from_scale(size.recip()) * DAffine2::from_translation(-DVec2::new(margin_x as f64, margin_y as f64));
+	let mut colors = vec![Color::TRANSPARENT; width * height];
+	fill_rows(&mut colors, width, |y, row| {
+		for (x, color) in row.iter_mut().enumerate() {
+			*color = sample_paint(pixels_to_placement.transform_point2(DVec2::new(x as f64 + 0.5, y as f64 + 0.5)));
 		}
 	});
-	[lighting.map(|[highlight, ..]| highlight), lighting.map(|[_, shadow, ..]| shadow)]
+	Some(colors)
 }
 
-/// The image with a coverage, tinted by `color` mixed with the full-strength content's colors by the blend mode in gamma, placed over it within the full-strength content.
-fn composite_within_by_mode(image: &Plane<[f32; 4]>, coverage: &Plane<f32>, full_content: &Plane<[f32; 4]>, color: Color, blend_mode: BlendMode) -> Plane<[f32; 4]> {
-	if blend_mode == BlendMode::Normal {
-		return composite_within(image, coverage, full_content, color);
-	}
-	let [red, green, blue, opacity] = color.to_gamma_srgb_channels();
-
-	let mut result = Plane::<[f32; 4]>::new(image.width, image.height);
-	fill_rows(&mut result.data, image.width, |y, row| {
-		for (x, composited) in row.iter_mut().enumerate() {
-			let index = y * image.width + x;
-			let (pixel, content) = (image.data[index], full_content.data[index]);
-			let (strength, alpha) = (opacity * coverage.data[index], content[3]);
-
-			let [tint_red, tint_green, tint_blue] = match alpha > 0. {
-				true => blend_gamma([content[0] / alpha, content[1] / alpha, content[2] / alpha], [red, green, blue], blend_mode),
-				false => [0.; 3],
-			};
-			let tinted = [tint_red * alpha, tint_green * alpha, tint_blue * alpha, alpha].map(|channel| channel * strength);
-			*composited = std::array::from_fn(|channel| tinted[channel] + pixel[channel] * (1. - strength));
-		}
-	});
-	result
-}
-
-/// The blend mode's mix of straight gamma-encoded `backdrop` and `paint` colors.
-fn blend_gamma(backdrop: [f32; 3], paint: [f32; 3], blend_mode: BlendMode) -> [f32; 3] {
-	match blend_mode {
-		// The component modes encode the colors they're given themselves
-		BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => {
-			let color = |[red, green, blue]: [f32; 3]| Color::from_gamma_srgb_channels(red, green, blue, 1.);
-			let [red, green, blue, _] = apply_blend_mode(color(paint), color(backdrop), blend_mode).to_gamma_srgb_channels();
-			[red, green, blue]
-		}
-		_ => {
-			let color = |[red, green, blue]: [f32; 3]| Color::from_rgbaf32_unchecked(red, green, blue, 1.);
-			let blended = apply_blend_mode(color(paint), color(backdrop), blend_mode);
-			[blended.r(), blended.g(), blended.b()]
-		}
-	}
-}
-
-/// Mixes the paint's color at each premultiplied gamma-encoded pixel over it by the blend mode, keeping the pixel's alpha.
-fn overlay(plane: &Plane<[f32; 4]>, paint: &[Color], blend_mode: BlendMode, opacity: f32) -> Plane<[f32; 4]> {
-	let data = plane
-		.data
-		.iter()
-		.zip(paint)
-		.map(|(&pixel, &paint)| match pixel[3] > 0. {
-			true => premultiplied_gamma_channels(overlay_paint(straight_linear_color(pixel), paint, blend_mode, opacity)),
-			false => [0.; 4],
-		})
-		.collect();
-	Plane {
-		width: plane.width,
-		height: plane.height,
-		data,
-	}
-}
-
-/// Samples the paint's color at points in the space its placement maps into, faded by its opacity, for the paints the CPU can draw: colors, images, generators, and linear or radial gradients.
+/// Samples the paint's color at points in the space its placement maps into, faded by its opacity, for the paints the CPU can draw: colors, images, generators, linear or radial gradients, and those nested in a placement of their own.
+/// The paint's own adjustments are carried out first, and an image's own effects too.
 fn paint_sampler(paint: &Graphic) -> Option<Box<dyn Fn(DVec2) -> Color + Sync + '_>> {
 	let inverse = |placement: DAffine2| (placement.matrix2.determinant() != 0.).then(|| placement.inverse());
 	let faded = |color: Color, opacity: f32| color.with_alpha(color.a() * opacity);
 
 	match paint {
 		Graphic::Color(item) => {
-			let color = faded(*item.element(), paint_opacity(item));
-			Some(Box::new(move |_| color))
+			// The fill fades the color beneath its paint overlays, which paint over it at full strength, as the renderers fill an endless color
+			let opacity = item.attribute_cloned_or::<f64>(ATTR_OPACITY, 1.) as f32;
+			let fill = item.attribute_cloned_or::<f64>(ATTR_OPACITY_FILL, 1.) as f32;
+			let adjustments = item.attribute::<Effects>(ATTR_EFFECTS).map(adjustments).unwrap_or_default();
+			let color = filled_color(*item.element(), &adjustments, fill);
+			Some(Box::new(move |_| faded(color, opacity)))
 		}
 		Graphic::RasterCPU(item) => {
-			let opacity = paint_opacity(item.as_ref());
-			let image = item.element();
-			let to_pixels = DAffine2::from_scale(DVec2::new(image.width as f64, image.height as f64)) * inverse(item.attribute_cloned_or_default(ATTR_TRANSFORM))?;
-			Some(Box::new(move |point| faded(image.sample_bilinear(to_pixels.transform_point2(point)), opacity)))
+			// Carrying out an image's effects fades it by its fill, which they take from it, so its opacity is found after
+			let item = evaluate_raster_effects((**item).clone());
+			let opacity = paint_opacity(&item);
+			let to_pixels = DAffine2::from_scale(DVec2::new(item.element().width as f64, item.element().height as f64)) * inverse(item.attribute_cloned_or_default(ATTR_TRANSFORM))?;
+			Some(Box::new(move |point| faded(sample_bilinear_gamma(item.element(), to_pixels.transform_point2(point)), opacity)))
 		}
 		Graphic::Generator(item) => {
 			let opacity = paint_opacity(item);
@@ -710,13 +984,75 @@ fn paint_sampler(paint: &Graphic) -> Option<Box<dyn Fn(DVec2) -> Color + Sync + 
 			let evaluator = item.element().evaluator(GradientSettings::from_item_attributes(&item));
 			Some(Box::new(move |point| faded(evaluator.evaluate(position(point)), opacity)))
 		}
+		Graphic::Graphic(item) => nested_sampler(item.element(), &|key| item.attributes().get_any(key)),
+		// Each graphic of a list lies over those before it, which only the renderers can mix by other blend modes
+		Graphic::GraphicList(list) => {
+			let samplers = (0..list.len())
+				.map(|index| {
+					let attribute = |key: &str| list.attribute_any(key, index);
+					let normal = attribute(ATTR_BLEND_MODE)
+						.and_then(|blend_mode| blend_mode.downcast_ref::<BlendMode>())
+						.is_none_or(|&blend_mode| blend_mode == BlendMode::Normal);
+					normal.then(|| nested_sampler(list.element(index)?, &attribute)).flatten()
+				})
+				.collect::<Option<Vec<_>>>()?;
+			Some(Box::new(move |point| {
+				let stacked = samplers.iter().fold([0.; 4], |beneath: [f32; 4], sampler| {
+					let over = premultiplied_gamma_channels(sampler(point));
+					std::array::from_fn(|channel| over[channel] + beneath[channel] * (1. - over[3]))
+				});
+				straight_linear_color(stacked)
+			}))
+		}
 		_ => None,
 	}
+}
+
+/// Samples a graphic nested within an envelope, with the `attribute` lookup giving its placement and opacity, or `None` if the envelope holds effects, which only the renderers can carry out on everything within it.
+fn nested_sampler<'a>(element: &'a Graphic, attribute: &dyn Fn(&str) -> Option<&'a dyn std::any::Any>) -> Option<Box<dyn Fn(DVec2) -> Color + Sync + 'a>> {
+	let read = |key: &str| attribute(key).and_then(|value| value.downcast_ref::<f64>()).copied().unwrap_or(1.);
+	if attribute(ATTR_EFFECTS).is_some() {
+		return None;
+	}
+
+	let placement = attribute(ATTR_TRANSFORM).and_then(|value| value.downcast_ref::<DAffine2>()).copied().unwrap_or_default();
+	let to_nested = (placement.matrix2.determinant() != 0.).then(|| placement.inverse())?;
+	let opacity = (read(ATTR_OPACITY) * read(ATTR_OPACITY_FILL)) as f32;
+	let sample = paint_sampler(element)?;
+	Some(Box::new(move |point| {
+		let color = sample(to_nested.transform_point2(point));
+		color.with_alpha(color.a() * opacity)
+	}))
 }
 
 /// The alpha multiplier an item's opacity attributes apply when it serves as a paint.
 fn paint_opacity<T>(item: &Item<T>) -> f32 {
 	(item.attribute_cloned_or::<f64>(ATTR_OPACITY, 1.) * item.attribute_cloned_or::<f64>(ATTR_OPACITY_FILL, 1.)) as f32
+}
+
+/// The image's color at a point in its pixels, interpolated between the four pixels nearest it on their premultiplied gamma-encoded channels as the GPU samples a texture, or transparent outside the image.
+fn sample_bilinear_gamma(image: &Image<Color>, point: DVec2) -> Color {
+	let size = DVec2::new(image.width as f64, image.height as f64);
+	if !(point.cmpge(DVec2::ZERO).all() && point.cmplt(size).all()) {
+		return Color::TRANSPARENT;
+	}
+
+	let point = point.clamp(DVec2::splat(0.5), size - 0.5);
+	let corner = (point - 0.5).floor();
+	let fraction = (point - 0.5 - corner).as_vec2();
+
+	let channels_at = |offset_x: i64, offset_y: i64| {
+		let (x, y) = (corner.x as i64 + offset_x, corner.y as i64 + offset_y);
+		let pixel = (x < image.width as i64 && y < image.height as i64)
+			.then(|| image.data.get((y * image.width as i64 + x) as usize))
+			.flatten();
+		pixel.map_or([0.; 4], |&pixel| premultiplied_gamma_channels(pixel))
+	};
+	let lerp = |a: [f32; 4], b: [f32; 4], t: f32| std::array::from_fn::<f32, 4, _>(|channel| a[channel] + (b[channel] - a[channel]) * t);
+
+	let top = lerp(channels_at(0, 0), channels_at(1, 0), fraction.x);
+	let bottom = lerp(channels_at(0, 1), channels_at(1, 1), fraction.x);
+	straight_linear_color(lerp(top, bottom, fraction.y))
 }
 
 /// How far along the gradient each point lies, or `None` where its placement collapses it.
@@ -756,6 +1092,102 @@ mod tests {
 	}
 
 	#[test]
+	fn a_feathered_mask_reads_past_the_image_without_growing_it() {
+		use graphic_types::MaskMode;
+
+		// A white image of 10 by 10 pixels at a pixel per unit, masked by a white image without a placement, which stretches across it and no further
+		let mask = EffectOperation::Mask {
+			mask: Graphic::from(Item::new_from_element(Raster::new_cpu(Image::new(1, 1, Color::WHITE)))),
+			mode: MaskMode::Luminance,
+			density: 100.,
+			feather: 2.,
+			invert: false,
+		};
+		let mut item = Item::new_from_element(Raster::new_cpu(Image::new(10, 10, Color::WHITE))).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(DVec2::splat(10.)));
+		graphic_types::stamp_effect(&mut item, graphic_types::Effect::new(&mask));
+		let evaluated = evaluate_raster_effects(item);
+		let image = evaluated.element();
+		assert_eq!((image.width, image.height), (10, 10), "a mask paints nothing past the image");
+
+		// The feather finds the mask's edge where the image ends, about 0.6 shown half a pixel within it, rather than an edge extended past it
+		let alpha_at = |x: u32, y: u32| image.data[(y * image.width + x) as usize].a();
+		assert!((0.5..0.7).contains(&alpha_at(0, 5)), "{}", alpha_at(0, 5));
+		assert!(alpha_at(5, 5) > 0.9, "{}", alpha_at(5, 5));
+	}
+
+	#[test]
+	fn image_paints_fade_by_their_fill_once_with_effects_of_their_own() {
+		use graphic_types::EffectKind;
+
+		// A white image at half fill with a Levels row changing nothing, which carrying out its effects fades by the fill
+		let image = Item::new_from_element(Raster::new_cpu(Image::new(2, 2, Color::WHITE)))
+			.with_attribute(ATTR_EFFECTS, Effects::from_operations([EffectOperation::default_for(EffectKind::Levels)]))
+			.with_attribute(ATTR_OPACITY_FILL, 0.5_f64);
+		let paint = Graphic::from(image);
+		let Some(sample) = paint_sampler(&paint) else { panic!("the CPU draws images") };
+		assert!((sample(DVec2::splat(0.5)).a() - 0.5).abs() < 1e-6, "{:?}", sample(DVec2::splat(0.5)));
+	}
+
+	#[test]
+	fn contour_gradient_outlines_measure_their_span_in_document_units() {
+		use core_types::list::ATTR_GRADIENT_SPACE;
+		use vector_types::gradient::{GradientSpace, GradientStop};
+
+		// A gradient from black to white in gamma, so a pixel's gray is its place across the outline
+		let stops = [(0., Color::BLACK), (1., Color::WHITE)].map(|(position, color)| GradientStop { position, midpoint: 0.5, color });
+		let paint = Graphic::from(Item::new_from_element(Gradient::new(stops)).with_attribute(ATTR_GRADIENT_SPACE, GradientSpace::RgbGamma));
+
+		// At two pixels per unit, an outline of 3 aligned outside spans 8 pixels from 7 past the edge
+		let mut item = Item::new_from_element(Raster::new_cpu(Image::new(20, 20, Color::WHITE))).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(DVec2::splat(10.)));
+		let outline = EffectOperation::Outline {
+			paint,
+			blend_mode: BlendMode::Normal,
+			weight: 3.,
+			align: graphic_types::vector_types::vector::style::StrokeAlign::Outside,
+			contour_gradient: true,
+		};
+		graphic_types::stamp_effect(&mut item, graphic_types::Effect::new(&outline));
+		let evaluated = evaluate_raster_effects(item);
+		let raster = evaluated.element();
+		let width = raster.width as usize;
+		let margin = (width - 20) / 2;
+		let gray = |x: usize| raster.data[(margin + 10) * width + x].to_gamma_srgb_channels()[0];
+
+		// The first pixel outside lies half a pixel past the edge, (7 - 0.5) / 8 across, and the band's last lies 5.5 past it
+		assert!((gray(margin - 1) - 207. / 255.).abs() < 1e-3, "the first pixel outside is {}", gray(margin - 1) * 255.);
+		assert!((gray(margin - 6) - 48. / 255.).abs() < 1e-3, "the band's last pixel is {}", gray(margin - 6) * 255.);
+	}
+
+	#[test]
+	fn textured_bevels_shade_nothing_beneath_the_content_past_their_slopes() {
+		use vector_types::gradient::GradientStop;
+
+		// A ramp from black to white across far more than the content, which lights flat ground wherever it reaches
+		let stops = [(0., Color::BLACK), (1., Color::WHITE)].map(|(position, color)| GradientStop { position, midpoint: 0.5, color });
+		let ramp = Item::new_from_element(Gradient::new(stops))
+			.with_attribute(ATTR_TRANSFORM, DAffine2::from_translation(DVec2::splat(-100.)) * DAffine2::from_scale(DVec2::splat(300.)))
+			.with_attribute(ATTR_GRADIENT_FORM, GradientForm::Linear);
+
+		let mut emboss = EffectOperation::default_for(graphic_types::EffectKind::BevelAndEmboss);
+		if let EffectOperation::BevelAndEmboss { style, size, texture, .. } = &mut emboss {
+			(*style, *size, *texture) = (BevelStyle::Emboss, 10., Graphic::from(ramp));
+		}
+		let mut item = Item::new_from_element(Raster::new_cpu(Image::new(20, 20, Color::WHITE))).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(DVec2::splat(20.)));
+		graphic_types::stamp_effect(&mut item, graphic_types::Effect::new(&emboss));
+		let evaluated = evaluate_raster_effects(item);
+		let raster = evaluated.element();
+		let width = raster.width as usize;
+		let margin = (width - 20) / 2;
+		let alpha = |x: usize| raster.data[(margin + 10) * width + x].a();
+
+		// An emboss of 10 spans 5 each way, so its slopes reach their foot 6 pixels out
+		assert!(alpha(margin - 3) > 0., "the slope beneath the content goes unshaded");
+		for x in 0..margin - 7 {
+			assert!(alpha(x) < 0.5 / 255., "pixel {x} past the foot is shaded by {}", alpha(x));
+		}
+	}
+
+	#[test]
 	fn an_inner_shadow_of_only_choke_shades_an_opaque_raster() {
 		use graphic_types::{Effect, stamp_effect};
 
@@ -763,6 +1195,7 @@ mod tests {
 		let mut item = Item::new_from_element(raster).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(DVec2::splat(8.)));
 		let inner_shadow = EffectOperation::InnerShadow {
 			color: Color::BLACK,
+			blend_mode: BlendMode::Multiply,
 			angle: 0.,
 			distance: 0.,
 			choke: 100.,
@@ -874,5 +1307,42 @@ mod tests {
 			..Default::default()
 		}));
 		assert_eq!(adjusted(&[emptied, Adjustment::MakeOpaque]), [[0.; 4]; 3]);
+	}
+
+	#[test]
+	fn interior_pieces_stack_within_the_contents_share_over_nothing() {
+		use crate::layer_blending::blend_pixel;
+
+		let (content, paint, strength, alpha) = ([0.9, 0.5, 0.2], [0.3, 0.8, 0.4], 0.75, 0.5);
+		for (blend_mode, fill) in [
+			(BlendMode::Multiply, 1.),
+			(BlendMode::Color, 1.),
+			(BlendMode::ColorDodge, 1.),
+			(BlendMode::Screen, 0.5),
+			(BlendMode::Multiply, 0.),
+		] {
+			let color = Color::from_gamma_srgb_channels(content[0], content[1], content[2], alpha);
+			let overlay = EffectOperation::Adjustment(Adjustment::ColorOverlay {
+				color: Color::from_gamma_srgb_channels(paint[0], paint[1], paint[2], 1.),
+				blend_mode,
+				opacity: strength as f64 * 100.,
+			});
+			let item = Item::new_from_element(Raster::new_cpu(Image::new(1, 1, color)))
+				.with_attribute(ATTR_EFFECTS, Effects::from_operations([overlay]))
+				.with_attribute(ATTR_OPACITY_FILL, fill as f64);
+			let [red, green, blue, actual_alpha] = evaluate_raster_effects(item).element().data[0].to_gamma_srgb_channels();
+
+			// For PSD interop, the faded content and the piece stack as layers over nothing within the share, which then scales the stack
+			let faded = content.map(|channel| channel * fill).into_iter().chain([fill]).collect::<Vec<_>>();
+			let stacked = blend_pixel(
+				paint.map(|channel| channel * strength).into_iter().chain([strength]).collect::<Vec<_>>().try_into().unwrap(),
+				faded.try_into().unwrap(),
+				blend_mode,
+			);
+			let expected_alpha = alpha * stacked[3];
+			let expected = [0, 1, 2].map(|channel| stacked[channel] / stacked[3]);
+			let close = [red, green, blue].iter().zip(expected).all(|(actual, expected)| (actual - expected).abs() < 2e-3) && (actual_alpha - expected_alpha).abs() < 2e-3;
+			assert!(close, "{blend_mode:?} at fill {fill}: {:?} against {expected:?} at {expected_alpha}", [red, green, blue, actual_alpha]);
+		}
 	}
 }

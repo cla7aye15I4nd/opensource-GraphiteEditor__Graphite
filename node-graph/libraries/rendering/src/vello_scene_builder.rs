@@ -1,5 +1,7 @@
+use crate::to_peniko::BlendModeExt;
 use glam::{DAffine2, DMat2, DVec2, UVec2};
 use graphene_hash::CacheHash;
+use graphic_types::effect_layers::EffectLayers;
 use graphic_types::effects::EffectCapture;
 use graphic_types::generator::GeneratorPattern;
 use graphic_types::raster_types::{CPU, Raster, Texture};
@@ -51,21 +53,24 @@ pub trait EffectsRenderer: Send {
 	/// Whether the GPU can carry out effects, without which effects groups draw their content faded by their fill.
 	fn renders_effects(&self) -> bool;
 
-	/// Renders the content `draw` draws, and each paint overlay's paint `draw_paint` draws by index, placed by `view` in premultiplied textures of `size`, returning one with `effects` carried out.
-	/// `effect_to_pixels` places the effects' space on the texture's pixels, and `fill` fades the content but not the shadows and glows cast from it.
-	/// With a `capture`, the texture instead holds that effect's coverage, as black with it in alpha.
+	/// Renders the content `draw` draws, and each of the effects' drawn paints `draw_paint` draws by index, placed by `view` in premultiplied textures of `size`,
+	/// returning one for each of the `layers` that `effects` carried out on it draw, with the mode it blends by.
+	/// `effect_to_pixels` places the effects' space on the texture's pixels, `fill` fades the content but not the shadows and glows cast from it, and `opacity` fades the layers.
+	/// With a `capture`, the only texture instead holds that effect's coverage, as black with it in alpha.
 	#[expect(clippy::too_many_arguments)]
 	fn render_effects(
 		&mut self,
 		size: UVec2,
 		view: Affine,
 		effects: &Effects,
+		layers: &EffectLayers,
 		fill: f32,
+		opacity: f32,
 		effect_to_pixels: DAffine2,
 		capture: Option<EffectCapture>,
 		draw_paint: &mut dyn FnMut(usize, &mut VelloSceneBuilder),
 		draw: &mut dyn FnMut(&mut VelloSceneBuilder),
-	) -> wgpu::Texture;
+	) -> Vec<(wgpu::Texture, core_types::blending::BlendMode)>;
 }
 
 /// The pixels behind an image the scene draws.
@@ -369,11 +374,16 @@ impl<'a> VelloSceneBuilder<'a> {
 	}
 
 	/// Draws the content `draw` draws with `effects` carried out on it in their `effect_space` (placed in the space of the drawn content), within `bounds` in that space (or everywhere for `None`),
-	/// drawing again for each part of a split render. `draw_paint` draws each paint overlay's paint by its index among them, and `fill` fades the content but not the shadows and glows cast from it.
+	/// drawing again for each part of a split render. `draw_paint` draws each of the effects' drawn paints by its index among them, and `fill` fades the content but not the shadows and glows cast from it.
+	/// The content blends by `blend_mode` and the effects by their own modes, each faded by `opacity`, onto what lies beneath, or with every effect flattened into the content's image if not `layered`.
+	#[expect(clippy::too_many_arguments)]
 	pub fn draw_effects(
 		&mut self,
 		effects: &Effects,
 		fill: f32,
+		opacity: f32,
+		blend_mode: core_types::blending::BlendMode,
+		layered: bool,
 		bounds: Option<Rect>,
 		effect_space: DAffine2,
 		draw_paint: &mut dyn FnMut(usize, &mut VelloSceneBuilder),
@@ -382,11 +392,12 @@ impl<'a> VelloSceneBuilder<'a> {
 		let capture = self.effect_capture.take();
 		let effect_to_device = DAffine2::from_cols_array(&self.view.as_coeffs()) * effect_space;
 		if !self.effects_renderer.as_ref().is_some_and(|renderer| renderer.renders_effects()) || !effect_to_device.matrix2.determinant().is_normal() {
-			self.push_viewport_layer(peniko::Mix::Normal, fill);
+			self.push_viewport_layer(peniko::BlendMode::new(blend_mode.to_peniko(), peniko::Compose::SrcOver), opacity * fill);
 			draw(self);
 			self.pop_layer();
 			return;
 		}
+		let layers = EffectLayers::plan(effects, blend_mode, fill, layered);
 
 		// The texture follows the viewport's axes if the effect space only turns and evenly scales, or else its own axes, scaled evenly to keep every direction's detail.
 		// A box blur, which isn't round, turns with its space only along that space's axes.
@@ -403,21 +414,28 @@ impl<'a> VelloSceneBuilder<'a> {
 		};
 		let device_to_frame = frame_to_device.inverse();
 		let document_to_frame = Affine::new(device_to_frame.to_cols_array()) * self.view;
-		let reach = effects.reach() * lengths_to_frame.determinant().abs().sqrt();
+		let length_scale = lengths_to_frame.determinant().abs().sqrt();
+		let (reach, working_reach) = (effects.reach() * length_scale, effects.working_reach() * length_scale);
 
-		// The content reaching into the viewport, rounded out to whole pixels of the frame
+		// The content and what its effects read past it, reaching into the viewport and rounded out to whole pixels of the frame.
+		// Past the view, what they read without painting (like a mask's feather) is kept as far as it fits without lowering the resolution.
 		let viewport = Rect::new(0., 0., self.width() as f64, self.height() as f64);
 		let viewport_in_frame = Affine::new(device_to_frame.to_cols_array()).transform_rect_bbox(viewport);
 		let content_bounds = bounds.map_or(viewport_in_frame, |bounds| document_to_frame.transform_rect_bbox(bounds));
-		let region = content_bounds.inflate(reach, reach).intersect(viewport_in_frame.inflate(reach, reach)).expand();
+		let max_size = self.max_texture_size.min(u16::MAX as u32);
+		let max_area = MAX_EFFECTS_AREA_PER_VIEWPORT_AREA * viewport.area();
+		let painted_region = content_bounds.inflate(working_reach, working_reach).intersect(viewport_in_frame.inflate(reach, reach));
+		let read_past_view = reach + growth_that_fits(painted_region, max_area, max_size as f64).min(working_reach - reach).max(0.);
+		let region = content_bounds
+			.inflate(working_reach, working_reach)
+			.intersect(viewport_in_frame.inflate(read_past_view, read_past_view))
+			.expand();
 		if !(region.width() > 0. && region.height() > 0.) {
 			return;
 		}
 
 		// A region too large for one texture, or for its memory, renders at a lower resolution, which the blurs and shadows that make it so large hide.
 		// Its size rounds up to a size class so a group that moves between renders keeps reusing the same textures.
-		let max_size = self.max_texture_size.min(u16::MAX as u32);
-		let max_area = MAX_EFFECTS_AREA_PER_VIEWPORT_AREA * viewport.area();
 		let resolution = (max_size as f64 / region.width().max(region.height())).min((max_area / region.area()).sqrt()).min(1.);
 		let size_along = |length: f64| ((length * resolution).ceil() as u32).next_multiple_of(EFFECTS_SIZE_CLASS).min(max_size);
 		let size = UVec2::new(size_along(region.width()), size_along(region.height()));
@@ -426,19 +444,35 @@ impl<'a> VelloSceneBuilder<'a> {
 		let content_view = Affine::scale(resolution) * Affine::translate(-origin) * document_to_frame;
 		let effect_to_pixels = DAffine2::from_cols_array(&content_view.as_coeffs()) * effect_space;
 		let Some(renderer) = self.effects_renderer.as_deref_mut() else { return };
-		let result = renderer.render_effects(size, content_view, effects, fill, effect_to_pixels, capture, draw_paint, draw);
+		let results = renderer.render_effects(size, content_view, effects, &layers, fill, opacity, effect_to_pixels, capture, draw_paint, draw);
 
-		// Draw the result where the content was
-		self.images.push(SceneImage::Rendered(result));
-		let id = TextureId(self.images.len() as u64 - 1);
-		self.scene
-			.set_transform(Affine::new(frame_to_device.to_cols_array()) * Affine::translate(origin) * Affine::scale(1. / resolution));
-		self.scene.set_paint(PaintType::Image(Image {
-			image: ImageSource::external_texture(id, TextureRegion::Full, true),
-			sampler: peniko::ImageSampler::new(),
-		}));
-		self.scene.set_paint_transform(Affine::IDENTITY);
-		self.scene.fill_rect(&Rect::new(0., 0., size.x as f64, size.y as f64));
+		// Draw each layer where the content was, blended onto what lies beneath, except a captured coverage, which is drawn as it is
+		let area = Rect::new(0., 0., size.x as f64, size.y as f64);
+		let texture_to_device = Affine::new(frame_to_device.to_cols_array()) * Affine::translate(origin) * Affine::scale(1. / resolution);
+		for (texture, blend_mode) in results {
+			let isolated = capture.is_none() && (opacity < 1. || blend_mode != core_types::blending::BlendMode::Normal);
+			if isolated {
+				self.scene.set_transform(texture_to_device);
+				self.scene.set_fill_rule(Fill::NonZero);
+				let blend_mode = peniko::BlendMode::new(blend_mode.to_peniko(), peniko::Compose::SrcOver);
+				self.scene.push_layer(Some(&area.to_path(SHAPE_TOLERANCE)), Some(blend_mode), Some(opacity), None, None);
+				self.pushed.push(Pushed::Layer);
+			}
+
+			self.images.push(SceneImage::Rendered(texture));
+			let id = TextureId(self.images.len() as u64 - 1);
+			self.scene.set_transform(texture_to_device);
+			self.scene.set_paint(PaintType::Image(Image {
+				image: ImageSource::external_texture(id, TextureRegion::Full, true),
+				sampler: peniko::ImageSampler::new(),
+			}));
+			self.scene.set_paint_transform(Affine::IDENTITY);
+			self.scene.fill_rect(&area);
+
+			if isolated {
+				self.pop_layer();
+			}
+		}
 	}
 
 	fn draw_image_source(&mut self, source: ImageSource, sampler: peniko::ImageSampler, transform: Affine, (width, height): (u32, u32)) {
@@ -579,6 +613,17 @@ fn is_similarity(linear: DMat2) -> bool {
 fn is_axis_aligned(linear: DMat2) -> bool {
 	let tolerance = 1e-9 * linear.x_axis.abs().max_element().max(linear.y_axis.abs().max_element());
 	(linear.x_axis.y.abs() <= tolerance && linear.y_axis.x.abs() <= tolerance) || (linear.x_axis.x.abs() <= tolerance && linear.y_axis.y.abs() <= tolerance)
+}
+
+/// How far `rect` can grow on every side, a pixel short of reaching `max_area` or `max_size` along either axis, or 0 if it already reaches them.
+fn growth_that_fits(rect: Rect, max_area: f64, max_size: f64) -> f64 {
+	let (width, height) = (rect.width().max(0.), rect.height().max(0.));
+
+	// The positive root of (width + 2 × growth) × (height + 2 × growth) = max_area, whose discriminant is never negative
+	let sum = width + height;
+	let by_area = (-sum + (sum * sum - 4. * (width * height - max_area)).sqrt()) / 4.;
+	let by_size = (max_size - width.max(height)) / 2.;
+	(by_area.min(by_size) - 1.).max(0.)
 }
 
 /// The most the linear map stretches any length, its largest singular value.
