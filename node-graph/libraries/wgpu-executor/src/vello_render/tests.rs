@@ -359,11 +359,27 @@ fn render_square_with_effects(effects: Vec<graphic_types::EffectOperation>, fill
 
 /// Like [`render_square_with_effects`], carrying out the effects in an `effect_space` placed in the document.
 fn render_square_with_effects_in(effects: Vec<graphic_types::EffectOperation>, effect_space: DAffine2, fill: f32, min: f64, max: f64, size: UVec2) -> Option<Vec<[u8; 4]>> {
-	let square = Rect::new(min, min, max, max);
-	let effects = graphic_types::Effects::from_operations(effects);
+	use rendering::{Render, RenderParams};
 
+	let square = Rect::new(min, min, max, max);
+
+	// The paint overlays' paints, drawn as the renderer does for content placed in the scene's space
+	let paints: Vec<graphic_types::Graphic> = (effects.iter())
+		.filter_map(|operation| match operation {
+			graphic_types::EffectOperation::PaintOverlay { paint, .. } => Some(paint),
+			_ => None,
+		})
+		.map(|paint| graphic_types::fitted_paint(paint, [glam::DVec2::splat(min), glam::DVec2::splat(max)]).unwrap_or_else(|| paint.clone()))
+		.collect();
+	let mut draw_paint = |index: usize, scene: &mut VelloSceneBuilder| {
+		if let Some(paint) = paints.get(index) {
+			paint.render_to_vello(scene, DAffine2::IDENTITY, &RenderParams::default().for_pattern());
+		}
+	};
+
+	let effects = graphic_types::Effects::from_operations(effects);
 	render(size, |scene| {
-		scene.draw_effects(&effects, fill, Some(square), effect_space, &mut |scene| {
+		scene.draw_effects(&effects, fill, Some(square), effect_space, &mut draw_paint, &mut |scene| {
 			scene.fill(Fill::NonZero, Affine::IDENTITY, Color::WHITE, None, &square)
 		});
 	})
@@ -512,6 +528,137 @@ fn shadows_and_glows_fall_where_they_should() {
 }
 
 #[test]
+fn inner_glows_satins_outlines_and_bevels_fall_where_they_should() {
+	use core_types::Color as GraphicColor;
+	use graphic_types::vector_types::vector::style::StrokeAlign;
+	use graphic_types::{BevelDirection, BevelStyle, BevelTechnique, EffectOperation, GlowSource, GlowTechnique};
+
+	let size = UVec2::new(128, 128);
+	let black = GraphicColor::BLACK;
+	let render_square = |effect| render_square_with_effects(vec![effect], 1., 30., 80., size);
+	let (white, clear) = ([255, 255, 255, 255], 0);
+
+	// A fully choked inner glow from the edges covers a band inside them, and one from the center covers the rest
+	let inner_glow = |source| EffectOperation::InnerGlow {
+		color: black.into(),
+		technique: GlowTechnique::Softer,
+		source,
+		choke: 100.,
+		size: 3.,
+		range: 100.,
+		contour: Default::default(),
+	};
+	let Some(pixels) = render_square(inner_glow(GlowSource::Edge)) else { return };
+	assert_eq!(pixel(&pixels, size, 31, 55), [0, 0, 0, 255], "the edge glows");
+	assert_eq!(pixel(&pixels, size, 55, 55), white, "the center doesn't");
+	assert_eq!(pixel(&pixels, size, 25, 55)[3], clear, "nothing outside");
+	let Some(pixels) = render_square(inner_glow(GlowSource::Center)) else { return };
+	assert_eq!(pixel(&pixels, size, 31, 55), white, "the edge doesn't glow");
+	assert_eq!(pixel(&pixels, size, 55, 55), [0, 0, 0, 255], "the center does");
+
+	// Satin shades where the two casts of the silhouette disagree, which for a horizontal offset is a band along each side
+	let satin = EffectOperation::Satin {
+		color: black,
+		angle: 180.,
+		distance: 10.,
+		size: 0.,
+		invert: false,
+		contour: Default::default(),
+	};
+	let Some(pixels) = render_square(satin) else { return };
+	assert_eq!(pixel(&pixels, size, 35, 55), [0, 0, 0, 255], "the left band");
+	assert_eq!(pixel(&pixels, size, 55, 55), white, "the middle, where both casts cover");
+	assert_eq!(pixel(&pixels, size, 75, 55), [0, 0, 0, 255], "the right band");
+
+	// An outline outside the edge rounds the corners it grows around, and one inside stays within the content
+	let outline = |align| EffectOperation::Outline { color: black, weight: 5., align };
+	let Some(pixels) = render_square(outline(StrokeAlign::Outside)) else { return };
+	assert_eq!(pixel(&pixels, size, 26, 55), [0, 0, 0, 255], "within the weight of the edge");
+	assert_eq!(pixel(&pixels, size, 23, 55)[3], clear, "past the weight");
+	assert_eq!(pixel(&pixels, size, 27, 27), [0, 0, 0, 255], "near the corner");
+	assert_eq!(pixel(&pixels, size, 25, 25)[3], clear, "beyond the rounded corner, where a square would reach");
+	assert_eq!(pixel(&pixels, size, 55, 55), white, "the content shows");
+	let Some(pixels) = render_square(outline(StrokeAlign::Inside)) else { return };
+	assert_eq!(pixel(&pixels, size, 32, 55), [0, 0, 0, 255], "inside the edge");
+	assert_eq!(pixel(&pixels, size, 40, 55), white, "past the weight inside");
+	assert_eq!(pixel(&pixels, size, 28, 55)[3], clear, "nothing outside");
+
+	// Lit from the upper left, a raised bevel's top slope catches the highlight and its bottom slope falls into shadow, which swap when it sinks
+	let bevel = |style, direction| EffectOperation::BevelAndEmboss {
+		style,
+		technique: BevelTechnique::Smooth,
+		depth: 100.,
+		direction,
+		size: 5.,
+		soften: 0.,
+		angle: 120.,
+		altitude: 30.,
+		highlight_color: GraphicColor::RED,
+		highlight_blend_mode: core_types::blending::BlendMode::Normal,
+		shadow_color: GraphicColor::BLUE,
+		shadow_blend_mode: core_types::blending::BlendMode::Normal,
+	};
+	let reddish = |[red, green, blue, alpha]: [u8; 4]| red > 200 && green < 128 && blue < 128 && alpha > 128;
+	let bluish = |[red, green, blue, alpha]: [u8; 4]| blue > 200 && red < 128 && green < 128 && alpha > 128;
+	let Some(pixels) = render_square(bevel(BevelStyle::InnerBevel, BevelDirection::Up)) else { return };
+	assert!(reddish(pixel(&pixels, size, 55, 32)), "the top slope is highlighted: {:?}", pixel(&pixels, size, 55, 32));
+	assert!(bluish(pixel(&pixels, size, 55, 77)), "the bottom slope is shaded: {:?}", pixel(&pixels, size, 55, 77));
+	assert_eq!(pixel(&pixels, size, 55, 55), white, "the flat top inside the slopes is unlit");
+	assert_eq!(pixel(&pixels, size, 55, 20)[3], clear, "nothing outside");
+	let Some(pixels) = render_square(bevel(BevelStyle::InnerBevel, BevelDirection::Down)) else {
+		return;
+	};
+	assert!(bluish(pixel(&pixels, size, 55, 32)), "a sunken top slope is shaded: {:?}", pixel(&pixels, size, 55, 32));
+	assert!(reddish(pixel(&pixels, size, 55, 77)), "a sunken bottom slope is highlighted: {:?}", pixel(&pixels, size, 55, 77));
+
+	// An outer bevel's slopes lie outside the content, beneath it
+	let Some(pixels) = render_square(bevel(BevelStyle::OuterBevel, BevelDirection::Up)) else { return };
+	assert!(reddish(pixel(&pixels, size, 55, 27)), "the top slope outside is highlighted: {:?}", pixel(&pixels, size, 55, 27));
+	assert!(bluish(pixel(&pixels, size, 55, 82)), "the bottom slope outside is shaded: {:?}", pixel(&pixels, size, 55, 82));
+	assert_eq!(pixel(&pixels, size, 55, 40), white, "the content inside is unlit");
+}
+
+#[test]
+fn paint_overlays_stretch_unplaced_paints_across_the_content() {
+	use core_types::Color as GraphicColor;
+	use core_types::blending::BlendMode;
+	use core_types::list::Item;
+	use graphic_types::raster_types::{Image, Raster};
+	use graphic_types::vector_types::gradient::{Gradient, GradientStop};
+	use graphic_types::{EffectOperation, Graphic};
+
+	let size = UVec2::new(128, 128);
+	let overlay = |paint: Graphic| EffectOperation::PaintOverlay {
+		paint,
+		blend_mode: BlendMode::Normal,
+		opacity: 100.,
+	};
+	let reddish = |[red, green, blue, alpha]: [u8; 4]| red > 200 && green < 64 && blue < 64 && alpha == 255;
+	let bluish = |[red, green, blue, alpha]: [u8; 4]| blue > 200 && red < 64 && green < 64 && alpha == 255;
+
+	// A gradient from red to blue runs from the square's left edge to its right edge
+	let stops = [(0., GraphicColor::RED), (1., GraphicColor::BLUE)].map(|(position, color)| GradientStop { position, midpoint: 0.5, color });
+	let Some(pixels) = render_square_with_effects(vec![overlay(Graphic::from(Gradient::new(stops)))], 1., 30., 80., size) else {
+		return;
+	};
+	assert!(reddish(pixel(&pixels, size, 31, 55)), "the start at the left edge: {:?}", pixel(&pixels, size, 31, 55));
+	assert!(bluish(pixel(&pixels, size, 78, 55)), "the end at the right edge: {:?}", pixel(&pixels, size, 78, 55));
+	assert_eq!(pixel(&pixels, size, 25, 55)[3], 0, "nothing outside the content");
+
+	// An image of a red pixel beside a blue one covers the square, each pixel half of it
+	let image = Image {
+		width: 2,
+		height: 1,
+		data: vec![GraphicColor::RED, GraphicColor::BLUE],
+	};
+	let Some(pixels) = render_square_with_effects(vec![overlay(Graphic::from(Item::new_from_element(Raster::new_cpu(image))))], 1., 30., 80., size) else {
+		return;
+	};
+	assert!(reddish(pixel(&pixels, size, 35, 40)), "the left half: {:?}", pixel(&pixels, size, 35, 40));
+	assert!(bluish(pixel(&pixels, size, 75, 70)), "the right half: {:?}", pixel(&pixels, size, 75, 70));
+}
+
+#[test]
 fn later_shadows_stack_over_earlier_ones_beneath_the_content() {
 	use core_types::Color as GraphicColor;
 	use glam::DVec2;
@@ -544,8 +691,8 @@ fn nested_effects_groups_render_inside_out() {
 		gamma: false,
 	}]);
 	let draw = |scene: &mut VelloSceneBuilder| {
-		scene.draw_effects(&shadow, 1., Some(square.inflate(12., 12.)), DAffine2::IDENTITY, &mut |scene| {
-			scene.draw_effects(&blur, 1., Some(square), DAffine2::IDENTITY, &mut |scene| {
+		scene.draw_effects(&shadow, 1., Some(square.inflate(12., 12.)), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
+			scene.draw_effects(&blur, 1., Some(square), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
 				scene.fill(Fill::NonZero, Affine::IDENTITY, Color::WHITE, None, &square)
 			});
 		});
@@ -560,22 +707,60 @@ fn nested_effects_groups_render_inside_out() {
 }
 
 #[test]
+fn captured_coverages_the_effects_never_reach_cover_nothing() {
+	use graphic_types::effects::EffectCapture;
+	use graphic_types::{EffectKind, EffectOperation, Effects};
+
+	let size = UVec2::new(64, 64);
+	let square = Rect::new(20., 20., 40., 40.);
+
+	// The default outline lies outside the edge, so it has no band inside for its second plane to capture
+	let outline = Effects::from_operations([EffectOperation::default_for(EffectKind::Outline)]);
+	let draw = |scene: &mut VelloSceneBuilder| {
+		scene.capture_next_effects(EffectCapture { index: 0, plane: 1 });
+		scene.draw_effects(&outline, 1., Some(square), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
+			scene.fill(Fill::NonZero, Affine::IDENTITY, Color::WHITE, None, &square)
+		});
+	};
+
+	let Some(pixels) = render(size, draw) else { return };
+	assert!(pixels.iter().all(|pixel| pixel[3] == 0), "the capture holds the finished image instead of nothing");
+}
+
+#[test]
 fn cpu_evaluated_effects_match_the_gpu_passes() {
 	use core_types::Color as GraphicColor;
+	use core_types::blending::BlendMode;
+	use core_types::list::ATTR_GRADIENT_FORM;
 	use core_types::list::Item;
 	use core_types::transfer_curve::TransferCurve;
 	use core_types::{ATTR_OPACITY_FILL, ATTR_TRANSFORM};
 	use glam::DVec2;
 	use graphic_types::adjustment::{Adjustment, LevelsRecord, LevelsSettings};
 	use graphic_types::raster_types::{Image, Raster};
-	use graphic_types::vector_types::gradient::{Gradient, GradientStop};
-	use graphic_types::{Effect, EffectOperation, GlowTechnique, Graphic, stamp_effect};
+	use graphic_types::vector_types::gradient::{Gradient, GradientForm, GradientStop};
+	use graphic_types::vector_types::vector::style::StrokeAlign;
+	use graphic_types::{BevelDirection, BevelStyle, BevelTechnique, Effect, EffectOperation, GlowSource, GlowTechnique, Graphic, stamp_effect};
 	use raster_kernels::evaluate_raster_effects;
 
 	let size = UVec2::new(160, 160);
 	let (min, max) = (50, 100);
 	let shadow_color = GraphicColor::from_rgbaf32_unchecked(0.1, 0.2, 0.8, 0.75);
 	let blur = |radius, box_blur, gamma| EffectOperation::Blur { radius, box_blur, gamma };
+	let bevel = |style, technique, direction, size, soften| EffectOperation::BevelAndEmboss {
+		style,
+		technique,
+		depth: 150.,
+		direction,
+		size,
+		soften,
+		angle: 120.,
+		altitude: 30.,
+		highlight_color: GraphicColor::from_rgbaf32_unchecked(1., 0.9, 0.2, 0.75),
+		highlight_blend_mode: BlendMode::Screen,
+		shadow_color,
+		shadow_blend_mode: BlendMode::Multiply,
+	};
 	let identity = LevelsRecord {
 		shadows: 0.,
 		midtones: 1.,
@@ -598,6 +783,10 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 		stop(0., GraphicColor::from_rgbaf32_unchecked(1., 0.9, 0.2, 1.)),
 		stop(0.4, GraphicColor::from_rgbaf32_unchecked(0.9, 0.2, 0.1, 0.8)),
 		stop(1., GraphicColor::from_rgbaf32_unchecked(0.2, 0., 0.6, 0.)),
+	]));
+	let inner_gradient = Graphic::from(Gradient::new([
+		stop(0., GraphicColor::from_rgbaf32_unchecked(0.9, 0.9, 0.2, 0.9)),
+		stop(1., GraphicColor::from_rgbaf32_unchecked(0.1, 0.5, 0.9, 0.3)),
 	]));
 	let opaque = Graphic::from(Gradient::new([
 		stop(0., GraphicColor::from_rgbaf32_unchecked(0.1, 0.8, 0.3, 1.)),
@@ -625,7 +814,69 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 		vec![glow(GlowTechnique::Precise, 80., 10., 100., TransferCurve::default())],
 		vec![glow(GlowTechnique::Softer, 0., 6., 50., bow.clone())],
 		vec![gradient_glow(fading, GlowTechnique::Precise, 0., 14., 75., TransferCurve::default())],
-		vec![gradient_glow(opaque, GlowTechnique::Softer, 25., 12., 50., bow)],
+		vec![gradient_glow(opaque, GlowTechnique::Softer, 25., 12., 50., bow.clone())],
+		vec![EffectOperation::InnerGlow {
+			color: shadow_color.into(),
+			technique: GlowTechnique::Softer,
+			source: GlowSource::Edge,
+			choke: 25.,
+			size: 7.,
+			range: 50.,
+			contour: TransferCurve::default(),
+		}],
+		vec![EffectOperation::InnerGlow {
+			color: shadow_color.into(),
+			technique: GlowTechnique::Precise,
+			source: GlowSource::Center,
+			choke: 0.,
+			size: 10.,
+			range: 75.,
+			contour: TransferCurve::default(),
+		}],
+		vec![EffectOperation::Satin {
+			color: shadow_color,
+			angle: 25.,
+			distance: 7.,
+			size: 6.,
+			invert: true,
+			contour: TransferCurve::default(),
+		}],
+		vec![EffectOperation::Satin {
+			color: shadow_color,
+			angle: -110.,
+			distance: 9.,
+			size: 3.,
+			invert: false,
+			contour: bow,
+		}],
+		vec![EffectOperation::Outline {
+			color: shadow_color,
+			weight: 6.,
+			align: StrokeAlign::Outside,
+		}],
+		vec![EffectOperation::Outline {
+			color: shadow_color,
+			weight: 5.,
+			align: StrokeAlign::Inside,
+		}],
+		vec![EffectOperation::Outline {
+			color: shadow_color,
+			weight: 9.,
+			align: StrokeAlign::Center,
+		}],
+		vec![EffectOperation::InnerGlow {
+			color: inner_gradient,
+			technique: GlowTechnique::Precise,
+			source: GlowSource::Center,
+			choke: 20.,
+			size: 9.,
+			range: 50.,
+			contour: TransferCurve::default(),
+		}],
+		vec![bevel(BevelStyle::InnerBevel, BevelTechnique::Smooth, BevelDirection::Up, 8., 0.)],
+		vec![bevel(BevelStyle::OuterBevel, BevelTechnique::ChiselHard, BevelDirection::Down, 6., 2.)],
+		vec![bevel(BevelStyle::Emboss, BevelTechnique::ChiselSoft, BevelDirection::Up, 10., 0.)],
+		vec![bevel(BevelStyle::PillowEmboss, BevelTechnique::Smooth, BevelDirection::Up, 12., 1.)],
 		// Bends alpha, so the fill must fade the content before it on both
 		vec![EffectOperation::Adjustment(Adjustment::Levels(Box::new(LevelsSettings {
 			composite: identity,
@@ -636,7 +887,62 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 		})))],
 	];
 
-	for effects in cases {
+	// Paint overlays over a colored backdrop, their paints placed on their own since the raster and the square fit unplaced paints to different bounds
+	let backdrop = EffectOperation::Adjustment(Adjustment::ColorOverlay {
+		color: GraphicColor::from_rgbaf32_unchecked(0.3, 0.6, 0.2, 1.),
+		blend_mode: BlendMode::Normal,
+		opacity: 100.,
+	});
+	let gradient = |form: GradientForm, transform: DAffine2| {
+		let stops = [(0., [0.9, 0.1, 0.4, 1.]), (0.5, [0.2, 0.3, 0.9, 0.5]), (1., [1., 0.9, 0.7, 1.])].map(|(position, [red, green, blue, alpha])| GradientStop {
+			position,
+			midpoint: 0.5,
+			color: GraphicColor::from_rgbaf32_unchecked(red, green, blue, alpha),
+		});
+		let item = Item::new_from_element(Gradient::new(stops)).with_attribute(ATTR_TRANSFORM, transform);
+		Graphic::from(item.with_attribute(ATTR_GRADIENT_FORM, form))
+	};
+	let linear = gradient(GradientForm::Linear, DAffine2::from_translation(DVec2::new(45., 60.)) * DAffine2::from_scale(DVec2::splat(60.)));
+	let radial = gradient(GradientForm::Radial, DAffine2::from_translation(DVec2::splat(75.)) * DAffine2::from_scale(DVec2::splat(30.)));
+
+	// A checkerboard with a pixel for each of the square's, so sampling it needs no interpolation
+	let checker = Image {
+		width: 50,
+		height: 50,
+		data: (0..2500)
+			.map(|index| match (index % 50 / 5 + index / 50 / 5) % 2 {
+				0 => GraphicColor::RED,
+				_ => GraphicColor::from_rgbaf32_unchecked(0., 0., 1., 0.5),
+			})
+			.collect(),
+	};
+	let checker_placement = DAffine2::from_translation(DVec2::splat(50.)) * DAffine2::from_scale(DVec2::splat(50.));
+	let checker = Graphic::from(Item::new_from_element(Raster::new_cpu(checker)).with_attribute(ATTR_TRANSFORM, checker_placement));
+
+	let overlay = |paint: &Graphic, blend_mode, opacity| {
+		vec![
+			backdrop.clone(),
+			EffectOperation::PaintOverlay {
+				paint: paint.clone(),
+				blend_mode,
+				opacity,
+			},
+		]
+	};
+	// Hard Mix's threshold and the hue of the gradient's grays turn the slightest rounding into large differences, so they take the checkerboard's exact colors instead
+	let ill_conditioned = [BlendMode::HardMix, BlendMode::Hue];
+	let mut paint_cases: Vec<_> = (BlendMode::list().into_iter().flatten())
+		.filter(|blend_mode| !ill_conditioned.contains(blend_mode))
+		.map(|&blend_mode| overlay(&linear, blend_mode, 100.))
+		.collect();
+	paint_cases.extend(ill_conditioned.map(|blend_mode| overlay(&checker, blend_mode, 100.)));
+	paint_cases.extend([
+		overlay(&linear, BlendMode::Normal, 40.),
+		overlay(&radial, BlendMode::Multiply, 100.),
+		overlay(&checker, BlendMode::Screen, 100.),
+	]);
+
+	for effects in cases.into_iter().chain(paint_cases) {
 		for fill in [1., 0.5] {
 			let Some(gpu) = render_square_with_effects(effects.clone(), fill, min as f64, max as f64, size) else {
 				return;
@@ -677,7 +983,17 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 					}
 				}
 			}
-			assert!(worst <= 2, "{effects:?} at fill {fill} differs from the GPU by up to {worst} levels");
+			// Modes that divide, or land near black where the gamma encoding is steepest, amplify the rounding of the rendered paint's eight bits
+			use BlendMode::*;
+			let tolerance = match effects.last() {
+				Some(EffectOperation::PaintOverlay { blend_mode: VividLight, .. }) => 16,
+				Some(EffectOperation::PaintOverlay {
+					blend_mode: ColorBurn | LinearBurn | ColorDodge | HardLight | LinearLight | PinLight,
+					..
+				}) => 8,
+				_ => 2,
+			};
+			assert!(worst <= tolerance, "{effects:?} at fill {fill} differs from the GPU by up to {worst} levels");
 		}
 	}
 }
@@ -740,7 +1056,7 @@ fn gpu_adjusted_texels(run: &[graphic_types::Adjustment], texels: &[[half::f16; 
 	let content = device.create_texture_with_data(&queue, &descriptor, wgpu::util::TextureDataOrder::LayerMajor, bytemuck::cast_slice(&padded));
 	let effects = Effects::from_operations(run.iter().cloned().map(EffectOperation::Adjustment));
 	let mut textures = crate::vello_effects::EffectTextures::default();
-	let adjusted = effect_passes.apply(device, &queue, &mut textures, &content, &effects, fill, glam::DMat2::IDENTITY, None);
+	let adjusted = effect_passes.apply(device, &queue, &mut textures, &content, &effects, fill, glam::DMat2::IDENTITY, &[], None);
 	drop(queue);
 
 	let bytes = executor.read_texture_pixels(&adjusted).expect("Failed to read back the adjusted colors");
@@ -1742,7 +2058,9 @@ fn gpu_adjustments_of_8_bit_content_match_the_cpu_kernels_at_the_edges_of_their_
 	let mut strays = Vec::new();
 	for (name, adjustment) in cases {
 		let effects = Effects::from_operations([EffectOperation::Adjustment(adjustment.clone())]);
-		let Some(pixels) = render(size, |scene| scene.draw_effects(&effects, 1., Some(square), DAffine2::IDENTITY, &mut |scene| draw_grays(scene))) else {
+		let Some(pixels) = render(size, |scene| {
+			scene.draw_effects(&effects, 1., Some(square), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| draw_grays(scene))
+		}) else {
 			return;
 		};
 
@@ -1800,7 +2118,7 @@ fn steep_adjustments_of_smooth_gradients_stay_smooth() {
 	// A layer just short of opaque is drawn in an intermediate texture of its own
 	for in_layer in [false, true] {
 		let Some(pixels) = render(size, |scene| {
-			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |scene| {
+			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
 				if in_layer {
 					scene.push_layer(Fill::NonZero, peniko::Mix::Normal, 0.999, Affine::IDENTITY, &bounds);
 				}
@@ -1948,7 +2266,7 @@ fn adjustments_leave_the_empty_space_around_content_empty() {
 	for (name, run, alpha_within) in cases {
 		let effects = Effects::from_operations(run.into_iter().map(EffectOperation::Adjustment));
 		let Some(pixels) = render(size, |scene| {
-			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |scene| {
+			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
 				scene.fill(Fill::NonZero, Affine::IDENTITY, RED, None, &circle((64., 64.), 20.))
 			});
 		}) else {
@@ -1959,6 +2277,79 @@ fn adjustments_leave_the_empty_space_around_content_empty() {
 		assert_eq!(pixel(&pixels, size, 64, 64)[3], alpha_within, "{name} within the content");
 		assert_eq!(pixel(&pixels, size, 42, 42), [0; 4], "{name} within the content's bounds");
 		assert_eq!(pixel(&pixels, size, 4, 4), [0; 4], "{name} past the content's bounds");
+	}
+}
+
+#[test]
+fn soft_chisels_on_translucent_content_match_the_cpu() {
+	use core_types::ATTR_TRANSFORM;
+	use core_types::Color as GraphicColor;
+	use core_types::list::Item;
+	use glam::DVec2;
+	use graphic_types::raster_types::{Image, Raster};
+	use graphic_types::{BevelStyle, BevelTechnique, Effect, EffectKind, EffectOperation, Effects, stamp_effect};
+	use raster_kernels::evaluate_raster_effects;
+
+	let size = UVec2::new(160, 160);
+	let (min, max) = (50, 110);
+	// Partial coverage gives every pixel inside a head start short of the whole slope, so seeds of differing values meet
+	let alpha = 140. / 255.;
+
+	for (style, bevel_size) in [(BevelStyle::InnerBevel, 10.), (BevelStyle::Emboss, 12.), (BevelStyle::OuterBevel, 8.), (BevelStyle::InnerBevel, 40.)] {
+		let mut bevel = EffectOperation::default_for(EffectKind::BevelAndEmboss);
+		if let EffectOperation::BevelAndEmboss {
+			style: bevel_style,
+			technique,
+			size: bevel_width,
+			highlight_color,
+			shadow_color,
+			..
+		} = &mut bevel
+		{
+			(*bevel_style, *technique, *bevel_width) = (style, BevelTechnique::ChiselSoft, bevel_size);
+			(*highlight_color, *shadow_color) = (GraphicColor::from_rgbaf32_unchecked(1., 0.9, 0.2, 0.75), GraphicColor::from_rgbaf32_unchecked(0.1, 0.2, 0.8, 0.75));
+		}
+		let effects = Effects::from_operations([bevel.clone()]);
+
+		let square = Rect::new(min as f64, min as f64, max as f64, max as f64);
+		let Some(gpu) = render(size, |scene| {
+			scene.draw_effects(&effects, 1., Some(square), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
+				scene.fill(Fill::NonZero, Affine::IDENTITY, Color::WHITE.with_alpha(alpha), None, &square)
+			});
+		}) else {
+			return;
+		};
+
+		// The same square as a raster covering the render one pixel to one pixel
+		let mut image = Image::new(size.x, size.y, GraphicColor::TRANSPARENT);
+		for y in min..max {
+			for x in min..max {
+				image.data[(y * size.x + x) as usize] = GraphicColor::WHITE.with_alpha(alpha);
+			}
+		}
+		let mut item = Item::new_from_element(Raster::new_cpu(image)).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(size.as_dvec2()));
+		stamp_effect(&mut item, Effect::new(&bevel));
+		let evaluated = evaluate_raster_effects(item);
+		let placement: DAffine2 = evaluated.attribute_cloned_or_default(ATTR_TRANSFORM);
+		let raster = evaluated.element();
+		let document_to_pixels = DAffine2::from_scale(DVec2::new(raster.width as f64, raster.height as f64)) * placement.inverse();
+
+		let mut worst = 0;
+		for y in 0..size.y {
+			for x in 0..size.x {
+				let point = document_to_pixels.transform_point2(DVec2::new(x as f64 + 0.5, y as f64 + 0.5)).floor();
+				let [red, green, blue, cpu_alpha] = raster.data[(point.y as u32 * raster.width + point.x as u32) as usize].to_gamma_srgb_channels();
+				let cpu = [red * cpu_alpha, green * cpu_alpha, blue * cpu_alpha, cpu_alpha].map(|channel| channel * 255.);
+
+				let gpu = pixel(&gpu, size, x, y);
+				let gpu_alpha = gpu[3] as f32 / 255.;
+				for channel in 0..4 {
+					let gpu_channel = if channel == 3 { gpu[3] as f32 } else { gpu[channel] as f32 * gpu_alpha };
+					worst = worst.max((cpu[channel] - gpu_channel).abs().round() as u32);
+				}
+			}
+		}
+		assert!(worst <= 2, "a soft {style:?} of {bevel_size} on translucent content differs from the GPU by up to {worst} levels");
 	}
 }
 
@@ -2039,7 +2430,7 @@ fn adjustments_on_image_textures_and_through_effects_groups_match_the_cpu_kernel
 		let effects = Effects::from_operations(run.iter().cloned().map(EffectOperation::Adjustment));
 		let through_effects_group = |scene: &mut VelloSceneBuilder| {
 			let bounds = Rect::new(0., 0., size.x as f64, size.y as f64);
-			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |scene| {
+			scene.draw_effects(&effects, 1., Some(bounds), DAffine2::IDENTITY, &mut |_, _| {}, &mut |scene| {
 				scene.draw_raster(raster.clone(), Vec::new(), peniko::ImageSampler::new(), Affine::IDENTITY)
 			});
 		};

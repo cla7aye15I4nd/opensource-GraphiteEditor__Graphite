@@ -540,6 +540,10 @@ tagged_value! {
 	AdjustmentChannel(raster_nodes::adjustments::AdjustmentChannel),
 	HueSaturationRange(raster_nodes::adjustments::HueSaturationRange),
 	GlowTechnique(graphic_types::GlowTechnique),
+	GlowSource(graphic_types::GlowSource),
+	BevelStyle(graphic_types::BevelStyle),
+	BevelDirection(graphic_types::BevelDirection),
+	BevelTechnique(graphic_types::BevelTechnique),
 	GridType(vector::misc::GridType),
 	GridTopology(vector::misc::GridTopology),
 	ArcType(vector::misc::ArcType),
@@ -690,6 +694,46 @@ impl TaggedValue {
 			})
 		}
 
+		fn to_stroke_align(input: &str) -> Option<vector::style::StrokeAlign> {
+			let mut choices = input.split("::");
+			let (first, second) = (choices.next()?.trim(), choices.next()?.trim());
+			if first == "StrokeAlign" {
+				return Some(match second {
+					"Center" => vector::style::StrokeAlign::Center,
+					"Inside" => vector::style::StrokeAlign::Inside,
+					"Outside" => vector::style::StrokeAlign::Outside,
+					_ => {
+						log::error!("Invalid StrokeAlign default type variant: {input}");
+						return None;
+					}
+				});
+			}
+
+			log::error!("Invalid StrokeAlign default type: {input}");
+			None
+		}
+
+		fn to_blend_mode(input: &str) -> Option<core_types::blending::BlendMode> {
+			use core_types::blending::BlendMode;
+
+			let Some(("BlendMode", variant)) = input.split_once("::").map(|(first, second)| (first.trim(), second.trim())) else {
+				log::error!("Invalid BlendMode default type: {input}");
+				return None;
+			};
+
+			// The variants hidden from the standard list are valid defaults too
+			let blend_mode = BlendMode::list()
+				.into_iter()
+				.flatten()
+				.chain(&[BlendMode::Erase, BlendMode::Restore, BlendMode::MultiplyAlpha])
+				.find(|blend_mode| format!("{blend_mode:?}") == variant)
+				.copied();
+			if blend_mode.is_none() {
+				log::error!("Invalid BlendMode default type variant: {input}");
+			}
+			blend_mode
+		}
+
 		match ty {
 			Type::Generic(_) => None,
 			Type::Concrete(concrete_type) => {
@@ -709,9 +753,14 @@ impl TaggedValue {
 					() if ty == TypeId::of::<Gradient>() => to_gradient(string).map(|gradient| TaggedValue::GradientRamp(gradient.into()))?,
 					() if ty == TypeId::of::<ReferencePoint>() => to_reference_point(string).map(TaggedValue::ReferencePoint)?,
 					() if ty == TypeId::of::<Footprint>() => to_footprint(string).map(TaggedValue::Footprint)?,
+					() if ty == TypeId::of::<vector::style::StrokeAlign>() => to_stroke_align(string).map(TaggedValue::StrokeAlign)?,
+					() if ty == TypeId::of::<core_types::blending::BlendMode>() => to_blend_mode(string).map(TaggedValue::BlendMode)?,
 					() if ty == TypeId::of::<DashPattern>() => TaggedValue::DashPattern(core_types::misc::parse_f64_list(string)),
 					() if ty == TypeId::of::<BoxCorners>() => TaggedValue::BoxCorners(core_types::misc::parse_f64_list(string)),
-					_ => return None,
+					_ => {
+						log::error!("No parser for a default value of type `{}`: {string}", concrete_type.name);
+						return None;
+					}
 				};
 				Some(ty)
 			}

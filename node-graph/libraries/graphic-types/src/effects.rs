@@ -7,16 +7,18 @@ use crate::adjustment::Adjustment;
 use crate::parameters::{ParameterVisitor, ReadParameters, WriteParameters};
 use core_types::ATTR_TRANSFORM;
 use core_types::Color;
+use core_types::blending::BlendMode;
 use core_types::color::SRGBA8;
 use core_types::graphene_hash::CacheHash;
 use core_types::list::{ATTR_EFFECTS, ATTR_OPACITY, ATTR_OPACITY_FILL, Item, List};
 use core_types::transfer_curve::TransferCurve;
 use dyn_any::DynAny;
-use glam::{DAffine2, DMat2, DVec2};
+use glam::{DAffine2, DMat2, DVec2, DVec3};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::ops::Range;
 use vector_types::gradient::GradientEvaluator;
+use vector_types::vector::style::StrokeAlign;
 use vector_types::{Gradient, GradientSettings};
 
 /// The image operation an [`Effect`] carries out.
@@ -31,6 +33,16 @@ pub enum EffectKind {
 	InnerShadow,
 	/// Surrounds the content with a soft glow of its silhouette.
 	OuterGlow,
+	/// Glows inward from the content's edges, or outward from its center.
+	InnerGlow,
+	/// Shades the content's interior with soft bands from its silhouette cast two ways.
+	Satin,
+	/// Draws a band of color along the content's silhouette.
+	Outline,
+	/// Lights the content as if raised from the surface or pressed into it, with highlights and shadows along its edges.
+	BevelAndEmboss,
+	/// Paints over the content within its silhouette, mixing with its colors by a blend mode. A solid color paint is the color overlay adjustment.
+	PaintOverlay,
 	// The adjustments, which change each color of the content on its own, as their nodes of the same names do
 	Desaturate,
 	GammaCorrection,
@@ -51,7 +63,6 @@ pub enum EffectKind {
 	ColorBalance,
 	PhotoFilter,
 	ColorLookup,
-	ColorOverlay,
 }
 
 impl std::fmt::Display for EffectKind {
@@ -61,6 +72,11 @@ impl std::fmt::Display for EffectKind {
 			Self::DropShadow => "Drop Shadow",
 			Self::InnerShadow => "Inner Shadow",
 			Self::OuterGlow => "Outer Glow",
+			Self::InnerGlow => "Inner Glow",
+			Self::Satin => "Satin",
+			Self::Outline => "Outline",
+			Self::BevelAndEmboss => "Bevel & Emboss",
+			Self::PaintOverlay => "Paint Overlay",
 			Self::Desaturate => "Desaturate",
 			Self::GammaCorrection => "Gamma Correction",
 			Self::MakeOpaque => "Make Opaque",
@@ -80,7 +96,6 @@ impl std::fmt::Display for EffectKind {
 			Self::ColorBalance => "Color Balance",
 			Self::PhotoFilter => "Photo Filter",
 			Self::ColorLookup => "Color Lookup",
-			Self::ColorOverlay => "Color Overlay",
 		})
 	}
 }
@@ -96,6 +111,19 @@ pub enum GlowTechnique {
 	Softer,
 	/// Fades evenly with the distance from the content's edges, following its details.
 	Precise,
+}
+
+/// Where an inner glow starts from.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, CacheHash, DynAny, node_macro::ChoiceType)]
+#[widget(Radio)]
+pub enum GlowSource {
+	/// Glows inward from the edges.
+	#[default]
+	Edge,
+	/// Glows outward from the center.
+	Center,
 }
 
 /// One of the coverages an effect is drawn from, which a render can output in place of the effects' result, so an SVG can embed it as a map of what its filters can't work out.
@@ -137,6 +165,89 @@ pub fn shape_strength(strength: f64, range: f64, contour: &impl Fn(f64) -> f64) 
 	contour((strength / range).clamp(0., 1.)).clamp(0., 1.)
 }
 
+/// Which slopes a bevel shapes from the content's edges.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, CacheHash, DynAny, node_macro::ChoiceType)]
+#[widget(Dropdown)]
+pub enum BevelStyle {
+	/// Slopes up from the edges into the content.
+	#[default]
+	InnerBevel,
+	/// Slopes down from the edges away from the content.
+	OuterBevel,
+	/// Slopes across the edges, half inside the content and half outside.
+	Emboss,
+	/// Slopes away from the edges both ways, as if pressed into the surface along them.
+	PillowEmboss,
+}
+
+/// Whether a bevel rises from the surface or sinks into it.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, CacheHash, DynAny, node_macro::ChoiceType)]
+#[widget(Radio)]
+pub enum BevelDirection {
+	/// Raised from the surface.
+	#[default]
+	Up,
+	/// Pressed into the surface.
+	Down,
+}
+
+/// How a bevel shapes its slopes from the content's edges.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, CacheHash, DynAny, node_macro::ChoiceType)]
+#[widget(Radio)]
+pub enum BevelTechnique {
+	/// Rounded slopes, like a blur of the content, which soften its finer details.
+	#[default]
+	Smooth,
+	/// Straight slopes measured from the edges, which follow the content's details.
+	ChiselHard,
+	/// Straight slopes like Chisel Hard, eased at their edges.
+	ChiselSoft,
+}
+
+/// The unit vector toward a bevel's light from its `angle` and `altitude` in degrees, with `lengths_to_target` mapping its effect space's directions into the y-down space it's lit in.
+pub fn bevel_light(angle: f64, altitude: f64, lengths_to_target: DMat2) -> DVec3 {
+	let (angle, altitude) = (angle.to_radians(), altitude.clamp(0., 90.).to_radians());
+	let across = (lengths_to_target * DVec2::new(angle.cos(), -angle.sin())).try_normalize().unwrap_or(DVec2::X);
+	(across * altitude.cos()).extend(altitude.sin())
+}
+
+/// How much a bevel's surface sloping up by `gradient` (its rise per unit along each axis) is lit past a flat surface's brightness by the `light`, and how much it falls short, each from 0 to 1.
+pub fn bevel_lighting(gradient: DVec2, light: DVec3) -> (f64, f64) {
+	let lit = (-gradient).extend(1.).normalize().dot(light);
+	let highlight = if light.z < 1. { (lit - light.z) / (1. - light.z) } else { 0. };
+	let shadow = if light.z > 0. { (light.z - lit) / light.z } else { 0. };
+	(highlight.clamp(0., 1.), shadow.clamp(0., 1.))
+}
+
+/// An overlay's paint with its unit square fitted to `content_bounds`, the content's extent in the space it's drawn in, if it's a gradient or image without its own placement.
+pub fn fitted_paint(paint: &Graphic, content_bounds: [DVec2; 2]) -> Option<Graphic> {
+	let unplaced = match paint {
+		Graphic::Gradient(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
+		Graphic::RasterCPU(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
+		Graphic::RasterGPU(item) => item.attribute::<DAffine2>(ATTR_TRANSFORM).is_none(),
+		_ => false,
+	};
+	if !unplaced {
+		return None;
+	}
+
+	let fit = DAffine2::from_translation(content_bounds[0]) * DAffine2::from_scale(content_bounds[1] - content_bounds[0]);
+	let mut paint = paint.clone();
+	match &mut paint {
+		Graphic::Gradient(item) => item.set_attribute(ATTR_TRANSFORM, fit),
+		Graphic::RasterCPU(item) => item.set_attribute(ATTR_TRANSFORM, fit),
+		Graphic::RasterGPU(item) => item.set_attribute(ATTR_TRANSFORM, fit),
+		_ => {}
+	}
+	Some(paint)
+}
+
 /// One image operation of an [`Effects`] list: an [`EffectKind`] plus its parameters, carried as attributes on the inner item.
 /// Each parameter's attribute is named after the input of the node that stamps the kind. Attributes the kind doesn't take are ignored.
 #[derive(Clone, Debug, Default, PartialEq, CacheHash)]
@@ -159,7 +270,21 @@ impl Effect {
 	pub fn operation(&self) -> EffectOperation {
 		let mut operation = EffectOperation::placeholder(self.kind());
 		operation.visit_parameters(&mut ReadParameters(&|key| self.0.attributes().get_any(key)));
-		operation.with_finite_lengths()
+		let operation = operation.with_finite_lengths();
+
+		// A solid paint mixes the same into every pixel, so the renderers carry it out with the other adjustments
+		match operation {
+			EffectOperation::PaintOverlay {
+				paint: Graphic::Color(color),
+				blend_mode,
+				opacity,
+			} => EffectOperation::Adjustment(Adjustment::ColorOverlay {
+				color: *color.element(),
+				blend_mode,
+				opacity,
+			}),
+			operation => operation,
+		}
 	}
 }
 
@@ -353,6 +478,15 @@ impl GlowFill {
 	}
 }
 
+/// How far an outline of `weight` reaches outside the silhouette's edge and inside it, by where it's aligned.
+pub fn outline_extents(weight: f64, align: StrokeAlign) -> (f64, f64) {
+	match align {
+		StrokeAlign::Outside => (weight, 0.),
+		StrokeAlign::Inside => (0., weight),
+		StrokeAlign::Center => (weight / 2., weight / 2.),
+	}
+}
+
 /// Appends an effect to the item's list, after those already applied to it, recording the item's transform at that point.
 /// Like a stroke's transform, it sets the space the effect's lengths and angles are measured in, so transforms applied later carry and scale the effect.
 pub fn stamp_effect<T>(item: &mut Item<T>, effect: Effect) {
@@ -462,6 +596,62 @@ pub enum EffectOperation {
 		range: f64,
 		contour: TransferCurve,
 	},
+	InnerGlow {
+		/// A solid color with the glow's opacity, or a gradient running from the content's edge inward (or from its center outward).
+		color: Graphic,
+		technique: GlowTechnique,
+		source: GlowSource,
+		/// The percentage of the size that hardens into a grow inward from the edges rather than softening.
+		choke: f64,
+		size: f64,
+		range: f64,
+		contour: TransferCurve,
+	},
+	Satin {
+		color: Color,
+		/// The direction each of the two casts of the silhouette is moved along, one each way, in degrees counterclockwise from the right.
+		angle: f64,
+		distance: f64,
+		size: f64,
+		invert: bool,
+		contour: TransferCurve,
+	},
+	Outline {
+		color: Color,
+		weight: f64,
+		align: StrokeAlign,
+	},
+	BevelAndEmboss {
+		style: BevelStyle,
+		technique: BevelTechnique,
+		/// The percentage that scales how steep the slopes are.
+		depth: f64,
+		direction: BevelDirection,
+		/// How wide the slopes are.
+		size: f64,
+		/// How much the highlights and shadows are blurred.
+		soften: f64,
+		/// The direction the light comes from, in degrees counterclockwise from the right.
+		angle: f64,
+		/// How high the light is above the surface, in degrees from flat to straight overhead.
+		altitude: f64,
+		/// With the highlight's opacity.
+		highlight_color: Color,
+		/// How the highlight mixes with the content's colors.
+		highlight_blend_mode: BlendMode,
+		/// With the shadow's opacity.
+		shadow_color: Color,
+		/// How the shadow mixes with the content's colors.
+		shadow_blend_mode: BlendMode,
+	},
+	/// Paints over the content with a paint other than a solid color, since a solid one decodes into the color overlay adjustment instead.
+	PaintOverlay {
+		/// Placed in the space the content's item is, or fitted to the content's bounds if it's a gradient or image without its own placement.
+		paint: Graphic,
+		blend_mode: BlendMode,
+		/// Percent.
+		opacity: f64,
+	},
 	Adjustment(Adjustment),
 }
 
@@ -477,6 +667,11 @@ impl EffectOperation {
 			Self::DropShadow { .. } => EffectKind::DropShadow,
 			Self::InnerShadow { .. } => EffectKind::InnerShadow,
 			Self::OuterGlow { .. } => EffectKind::OuterGlow,
+			Self::InnerGlow { .. } => EffectKind::InnerGlow,
+			Self::Satin { .. } => EffectKind::Satin,
+			Self::Outline { .. } => EffectKind::Outline,
+			Self::BevelAndEmboss { .. } => EffectKind::BevelAndEmboss,
+			Self::PaintOverlay { .. } => EffectKind::PaintOverlay,
 			Self::Adjustment(adjustment) => adjustment.kind(),
 		}
 	}
@@ -485,8 +680,13 @@ impl EffectOperation {
 	pub fn changes_nothing(&self) -> bool {
 		match self {
 			Self::Blur { radius, .. } => *radius <= 0.,
-			Self::DropShadow { color, .. } | Self::InnerShadow { color, .. } => color.a() <= 0.,
-			Self::OuterGlow { color, .. } => GlowFill::of(color).is_none_or(|fill| fill.is_invisible()),
+			Self::DropShadow { color, .. } | Self::InnerShadow { color, .. } | Self::Satin { color, .. } => color.a() <= 0.,
+			Self::OuterGlow { color, .. } | Self::InnerGlow { color, .. } => GlowFill::of(color).is_none_or(|fill| fill.is_invisible()),
+			Self::Outline { color, weight, .. } => color.a() <= 0. || *weight <= 0.,
+			Self::BevelAndEmboss {
+				highlight_color, shadow_color, size, ..
+			} => (highlight_color.a() <= 0. && shadow_color.a() <= 0.) || *size <= 0.,
+			Self::PaintOverlay { opacity, .. } => *opacity <= 0.,
 			Self::Adjustment(_) => false,
 		}
 	}
@@ -496,8 +696,8 @@ impl EffectOperation {
 		match self {
 			Self::Blur { .. } => true,
 			// Cast from the content's shape or changing each pixel alone
-			Self::DropShadow { .. } | Self::InnerShadow { .. } | Self::OuterGlow { .. } => false,
-			Self::Adjustment(_) => false,
+			Self::DropShadow { .. } | Self::InnerShadow { .. } | Self::OuterGlow { .. } | Self::InnerGlow { .. } | Self::Satin { .. } | Self::Outline { .. } | Self::BevelAndEmboss { .. } => false,
+			Self::PaintOverlay { .. } | Self::Adjustment(_) => false,
 		}
 	}
 
@@ -515,7 +715,11 @@ impl EffectOperation {
 			// Shadows and glows end within their size, past which a precise glow fades over one more unit.
 			Self::DropShadow { distance, size, .. } | Self::InnerShadow { distance, size, .. } => distance.abs() + size.max(0.) + 1.,
 			Self::OuterGlow { size, .. } => size.max(0.) + 1.,
-			Self::Adjustment(_) => 0.,
+			Self::InnerGlow { size, .. } => size.max(0.) + 1.,
+			Self::Satin { distance, size, .. } => distance.abs() + size.max(0.) + 1.,
+			Self::Outline { weight, .. } => weight.max(0.) + 1.,
+			Self::BevelAndEmboss { size, soften, .. } => size.max(0.) + soften.max(0.) + 2.,
+			Self::PaintOverlay { .. } | Self::Adjustment(_) => 0.,
 		}
 	}
 
@@ -536,7 +740,13 @@ impl EffectOperation {
 				[angle, distance, spread, size].into_iter().for_each(finite);
 			}
 			Self::OuterGlow { spread, size, range, .. } => [spread, size, range].into_iter().for_each(finite),
-			Self::Adjustment(_) => {}
+			Self::InnerGlow { choke, size, range, .. } => [choke, size, range].into_iter().for_each(finite),
+			Self::Satin { angle, distance, size, .. } => [angle, distance, size].into_iter().for_each(finite),
+			Self::Outline { weight, .. } => finite(weight),
+			Self::BevelAndEmboss {
+				depth, size, soften, angle, altitude, ..
+			} => [depth, size, soften, angle, altitude].into_iter().for_each(finite),
+			Self::PaintOverlay { .. } | Self::Adjustment(_) => {}
 		}
 		self
 	}
@@ -574,6 +784,47 @@ impl EffectOperation {
 				range: 0.,
 				contour: TransferCurve::default(),
 			},
+			EffectKind::InnerGlow => Self::InnerGlow {
+				color: Graphic::default(),
+				technique: GlowTechnique::default(),
+				source: GlowSource::default(),
+				choke: 0.,
+				size: 0.,
+				range: 0.,
+				contour: TransferCurve::default(),
+			},
+			EffectKind::Satin => Self::Satin {
+				color: Color::TRANSPARENT,
+				angle: 0.,
+				distance: 0.,
+				size: 0.,
+				invert: false,
+				contour: TransferCurve::default(),
+			},
+			EffectKind::Outline => Self::Outline {
+				color: Color::TRANSPARENT,
+				weight: 0.,
+				align: StrokeAlign::default(),
+			},
+			EffectKind::BevelAndEmboss => Self::BevelAndEmboss {
+				style: BevelStyle::default(),
+				technique: BevelTechnique::default(),
+				depth: 0.,
+				direction: BevelDirection::default(),
+				size: 0.,
+				soften: 0.,
+				angle: 0.,
+				altitude: 0.,
+				highlight_color: Color::TRANSPARENT,
+				highlight_blend_mode: BlendMode::default(),
+				shadow_color: Color::TRANSPARENT,
+				shadow_blend_mode: BlendMode::default(),
+			},
+			EffectKind::PaintOverlay => Self::PaintOverlay {
+				paint: Graphic::default(),
+				blend_mode: BlendMode::default(),
+				opacity: 0.,
+			},
 			EffectKind::Desaturate => Self::Adjustment(Adjustment::Desaturate { method: Default::default() }),
 			EffectKind::GammaCorrection => Self::Adjustment(Adjustment::GammaCorrection { gamma: 0., inverse: false }),
 			EffectKind::MakeOpaque => Self::Adjustment(Adjustment::MakeOpaque),
@@ -609,11 +860,6 @@ impl EffectOperation {
 				preserve_luminosity: false,
 			}),
 			EffectKind::ColorLookup => Self::Adjustment(Adjustment::ColorLookup { lut_file: Default::default() }),
-			EffectKind::ColorOverlay => Self::Adjustment(Adjustment::ColorOverlay {
-				color: Color::TRANSPARENT,
-				blend_mode: Default::default(),
-				opacity: 0.,
-			}),
 		}
 	}
 
@@ -676,6 +922,75 @@ impl EffectOperation {
 				visitor.parameter("range", range, 50.);
 				visitor.parameter("contour", contour, TransferCurve::default());
 			}
+			Self::InnerGlow {
+				color,
+				technique,
+				source,
+				choke,
+				size,
+				range,
+				contour,
+			} => {
+				visitor.parameter("color", color, Graphic::from(glow_color));
+				visitor.parameter("technique", technique, GlowTechnique::default());
+				visitor.parameter("source", source, GlowSource::default());
+				visitor.parameter("choke", choke, 0.);
+				visitor.parameter("size", size, 5.);
+				visitor.parameter("range", range, 50.);
+				visitor.parameter("contour", contour, TransferCurve::default());
+			}
+			Self::Satin {
+				color,
+				angle,
+				distance,
+				size,
+				invert,
+				contour,
+			} => {
+				visitor.parameter("color", color, Color::from(SRGBA8::new(0, 0, 0, 0x80)));
+				visitor.parameter("angle", angle, 19.);
+				visitor.parameter("distance", distance, 11.);
+				visitor.parameter("size", size, 14.);
+				visitor.parameter("invert", invert, true);
+				visitor.parameter("contour", contour, TransferCurve::default());
+			}
+			Self::Outline { color, weight, align } => {
+				visitor.parameter("color", color, Color::BLACK);
+				visitor.parameter("weight", weight, 3.);
+				visitor.parameter("align", align, StrokeAlign::Outside);
+			}
+			Self::BevelAndEmboss {
+				style,
+				technique,
+				depth,
+				direction,
+				size,
+				soften,
+				angle,
+				altitude,
+				highlight_color,
+				highlight_blend_mode,
+				shadow_color,
+				shadow_blend_mode,
+			} => {
+				visitor.parameter("style", style, BevelStyle::default());
+				visitor.parameter("technique", technique, BevelTechnique::default());
+				visitor.parameter("depth", depth, 100.);
+				visitor.parameter("direction", direction, BevelDirection::default());
+				visitor.parameter("size", size, 5.);
+				visitor.parameter("soften", soften, 0.);
+				visitor.parameter("angle", angle, 120.);
+				visitor.parameter("altitude", altitude, 30.);
+				visitor.parameter("highlight_color", highlight_color, Color::from(SRGBA8::new(0xff, 0xff, 0xff, 0xbf)));
+				visitor.parameter("highlight_blend_mode", highlight_blend_mode, BlendMode::Screen);
+				visitor.parameter("shadow_color", shadow_color, Color::from(SRGBA8::new(0, 0, 0, 0xbf)));
+				visitor.parameter("shadow_blend_mode", shadow_blend_mode, BlendMode::Multiply);
+			}
+			Self::PaintOverlay { paint, blend_mode, opacity } => {
+				visitor.parameter("paint", paint, Graphic::from(Color::BLACK));
+				visitor.parameter("blend_mode", blend_mode, BlendMode::default());
+				visitor.parameter("opacity", opacity, 100.);
+			}
 			Self::Adjustment(adjustment) => adjustment.visit_parameters(visitor),
 		}
 	}
@@ -684,6 +999,7 @@ impl EffectOperation {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use vector_types::{Gradient, GradientStop};
 
 	#[test]
 	fn rows_round_trip_their_operations_eliding_defaults() {
@@ -710,11 +1026,78 @@ mod tests {
 				range: 75.,
 				contour: TransferCurve::default(),
 			},
+			EffectOperation::InnerGlow {
+				color: Graphic::from(Color::GREEN),
+				technique: GlowTechnique::Precise,
+				source: GlowSource::Center,
+				choke: 20.,
+				size: 3.,
+				range: 50.,
+				contour: TransferCurve::default(),
+			},
+			EffectOperation::Satin {
+				color: Color::BLACK,
+				angle: 45.,
+				distance: 6.,
+				size: 2.,
+				invert: false,
+				contour: TransferCurve::new(vec![DVec2::ZERO, DVec2::new(0.5, 1.), DVec2::ONE]),
+			},
+			EffectOperation::Outline {
+				color: Color::RED,
+				weight: 7.,
+				align: StrokeAlign::Center,
+			},
+			EffectOperation::BevelAndEmboss {
+				style: BevelStyle::PillowEmboss,
+				technique: BevelTechnique::ChiselHard,
+				depth: 250.,
+				direction: BevelDirection::Down,
+				size: 12.,
+				soften: 2.,
+				angle: -45.,
+				altitude: 60.,
+				highlight_color: Color::YELLOW,
+				highlight_blend_mode: BlendMode::Overlay,
+				shadow_color: Color::BLUE,
+				shadow_blend_mode: BlendMode::Normal,
+			},
+			EffectOperation::PaintOverlay {
+				paint: Graphic::from(Gradient::new([0., 1.].map(|position| GradientStop {
+					position,
+					midpoint: 0.5,
+					color: Color::from_rgbaf32_unchecked(position as f32, 0., 1., 1.),
+				}))),
+				blend_mode: BlendMode::Multiply,
+				opacity: 60.,
+			},
+			EffectOperation::Adjustment(Adjustment::ColorOverlay {
+				color: Color::GREEN,
+				blend_mode: BlendMode::Screen,
+				opacity: 100.,
+			}),
 		];
 
 		for operation in operations {
 			assert_eq!(Effect::new(&operation).operation(), operation);
 		}
+
+		// A solid paint decodes into the color overlay adjustment, which the Paint Overlay row also carries
+		let solid = EffectOperation::PaintOverlay {
+			paint: Graphic::from(Color::RED),
+			blend_mode: BlendMode::Normal,
+			opacity: 50.,
+		};
+		let solid_row = Effect::new(&solid);
+		assert_eq!(solid_row.kind(), EffectKind::PaintOverlay);
+		assert_eq!(
+			solid_row.operation(),
+			EffectOperation::Adjustment(Adjustment::ColorOverlay {
+				color: Color::RED,
+				blend_mode: BlendMode::Normal,
+				opacity: 50.,
+			})
+		);
 
 		let default_row = Effect::new(&EffectOperation::default_for(EffectKind::DropShadow));
 		assert_eq!(default_row.0.attributes().iter_any().count(), 0, "a default operation stamps no parameters");
@@ -837,7 +1220,7 @@ mod tests {
 			ColorBalance,
 			PhotoFilter,
 			ColorLookup,
-			ColorOverlay,
+			PaintOverlay,
 		];
 		for kind in kinds {
 			let operation = EffectOperation::default_for(kind);
