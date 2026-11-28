@@ -5,16 +5,17 @@ use bytemuck::{Pod, Zeroable};
 use core_types::Color;
 use core_types::blending::BlendMode;
 use core_types::transfer_curve::TransferCurve;
-use glam::{DMat2, DVec2, UVec2};
+use glam::{DAffine2, DVec2, UVec2};
 use graphic_types::effect_layers::{EffectLayers, EffectPiece, LayerPart, PiecePlace, is_pixel_filter};
 use graphic_types::effects::{EffectCapture, GRADIENT_GLOW_FADE, GRADIENT_TABLE_SIZE, GlowFill, OutlineFill, bevel_light, contour_gradient_span, grow_and_tent, outline_extents, shadow_offset};
 use graphic_types::masks::{mask_feather_sigma, masked_radius_blur_levels};
 use graphic_types::{Adjustment, BevelDirection, BevelStyle, BevelTechnique, EffectOperation, Effects, GlowSource, GlowTechnique};
-use raster_kernels::effect_kernels::{BlurKernel, MAX_KERNEL_REACH, NEGLIGIBLE_LENGTH, chamfer_passes};
+use raster_kernels::effect_kernels::{BlurKernel, MAX_DIRECT_BOX_RADIUS, NEGLIGIBLE_LENGTH, chamfer_passes};
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use wgpu::util::DeviceExt;
 
+mod filters;
 mod masks;
 mod styles;
 
@@ -24,13 +25,18 @@ pub(crate) const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 /// The format of the silhouettes shadows and glows are cast from, which hold only coverage, or a distance.
 const COVERAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
+/// The format of sums carried between passes, which must keep full precision.
+const SUMS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
 /// How many samples of a contour the shaders interpolate between, enough to follow its spline to well within a level.
 const CONTOUR_SAMPLES: u32 = 256;
 /// How many samples of a glow's or outline's gradient the shaders read.
 const GRADIENT_SAMPLES: u32 = GRADIENT_TABLE_SIZE as u32;
 
-/// The most taps one kernel pass weighs, matching the length of the shader's array, which holds a kernel of [`MAX_KERNEL_REACH`] texels to each side in pairs.
-const MAX_TAPS: usize = 1 + 2 * MAX_KERNEL_REACH.div_ceil(2);
+/// How many taps the shader's parameters hold, enough for a blur kernel of [`raster_kernels::effect_kernels::MAX_KERNEL_REACH`] texels to each side in pairs, and few enough that a pass reading them all stays quick.
+/// A filter kernel with more takes a pass for each part of them.
+const PARAMETER_TAPS: usize = 81;
+const _: () = assert!(PARAMETER_TAPS > 2 * raster_kernels::effect_kernels::MAX_KERNEL_REACH.div_ceil(2));
 
 /// How many renders a pooled texture survives unused before it is freed.
 const UNUSED_TEXTURE_RENDER_LIMIT: u64 = 3;
@@ -46,7 +52,7 @@ struct Parameters {
 	tap_count: u32,
 	color: [f32; 4],
 	values: [f32; 4],
-	taps: [[f32; 4]; MAX_TAPS],
+	taps: [[f32; 4]; PARAMETER_TAPS],
 }
 
 impl Default for Parameters {
@@ -121,24 +127,33 @@ pub(crate) struct EffectPasses {
 
 impl EffectPasses {
 	pub(crate) fn new(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Self {
-		let renders_working_formats = [WORKING_FORMAT, COVERAGE_FORMAT]
+		let renders_working_formats = [WORKING_FORMAT, COVERAGE_FORMAT, SUMS_FORMAT]
 			.into_iter()
 			.all(|format| adapter.get_texture_format_features(format).allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
 		if !renders_working_formats {
 			log::warn!("This GPU can't render into the formats layer effects need, so content draws without its effects");
 		}
 
-		// The styles' and masks' passes live in files of their own, sharing this one's bindings and helpers
+		// The filters', styles', and masks' passes live in files of their own, sharing this one's bindings and helpers
 		let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("vello_effects.wgsl"),
-			source: wgpu::ShaderSource::Wgsl(concat!(include_str!("vello_effects.wgsl"), include_str!("vello_styles.wgsl"), include_str!("vello_masks.wgsl")).into()),
+			source: wgpu::ShaderSource::Wgsl(
+				concat!(
+					include_str!("vello_effects.wgsl"),
+					include_str!("vello_effects/filters.wgsl"),
+					include_str!("vello_styles.wgsl"),
+					include_str!("vello_masks.wgsl")
+				)
+				.into(),
+			),
 		});
 
-		let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+		// The `content` input is only loaded rather than sampled, so it can also take a 32-bit float texture, which can't be filtered
+		let texture_entry = |binding, filterable| wgpu::BindGroupLayoutEntry {
 			binding,
 			visibility: wgpu::ShaderStages::FRAGMENT,
 			ty: wgpu::BindingType::Texture {
-				sample_type: wgpu::TextureSampleType::Float { filterable: true },
+				sample_type: wgpu::TextureSampleType::Float { filterable },
 				view_dimension: wgpu::TextureViewDimension::D2,
 				multisampled: false,
 			},
@@ -147,9 +162,9 @@ impl EffectPasses {
 		let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
 			label: Some("vello_effects_bind_group_layout"),
 			entries: &[
-				texture_entry(0),
-				texture_entry(1),
-				texture_entry(2),
+				texture_entry(0, true),
+				texture_entry(1, true),
+				texture_entry(2, false),
 				wgpu::BindGroupLayoutEntry {
 					binding: 3,
 					visibility: wgpu::ShaderStages::FRAGMENT,
@@ -205,7 +220,7 @@ impl EffectPasses {
 	}
 
 	/// Carries out `effects` on `content`, a texture of premultiplied pixels, returning each of the `layers` they draw in a pooled texture of [`WORKING_FORMAT`] the same size, with the mode it blends by.
-	/// `lengths_to_pixels` maps the effects' lengths onto the texture's pixels, `fill` fades the content but not the shadows and glows cast from it, and `opacity` fades the layers.
+	/// `effect_to_pixels` places the effects' space on the texture's pixels, `fill` fades the content but not the shadows and glows cast from it, and `opacity` fades the layers.
 	/// `paints` holds the effects' drawn paints in order, each rendered over the same pixels as the content.
 	/// With a `capture`, the only result is instead that effect's coverage, as black with it in alpha, or the share [`EffectCapture::THROUGH_MASK`] names.
 	#[expect(clippy::too_many_arguments)]
@@ -219,7 +234,7 @@ impl EffectPasses {
 		layers: &EffectLayers,
 		fill: f32,
 		opacity: f32,
-		lengths_to_pixels: DMat2,
+		effect_to_pixels: DAffine2,
 		paints: &[wgpu::Texture],
 		capture: Option<EffectCapture>,
 	) -> Vec<(wgpu::Texture, BlendMode)> {
@@ -231,6 +246,7 @@ impl EffectPasses {
 			textures,
 			size: UVec2::new(content.width(), content.height()),
 		};
+		let lengths_to_pixels = effect_to_pixels.matrix2;
 		let length_scale = lengths_to_pixels.determinant().abs().sqrt();
 
 		// The content at full strength, which casts every silhouette, read from the content itself (whatever its format) until a pass replaces it
@@ -251,8 +267,13 @@ impl EffectPasses {
 		let knocks_out_by_layer = |piece: &EffectPiece| piece.knocks_out && (fill < 1. || layers.knockout_cover(piece.capture, opacity) < 1. || layers.masks_fade_knockout_cover(piece.capture));
 		let capture_needs_content_layer = capture == Some(EffectCapture::THROUGH_MASK) || captured_piece.as_ref().is_some_and(knocks_out_by_layer);
 
-		// Each operation with its index, for a capture to name, leaving out those that change nothing so they don't split the runs of adjustments around them
-		let operations: Vec<(usize, EffectOperation)> = effects.operations().enumerate().filter(|(_, operation)| !changes_nothing(operation, length_scale)).collect();
+		// Each operation with its index, for a capture to name, leaving out those that change nothing so they don't split the runs of adjustments around them.
+		// A blur whose result is captured runs however slight, so its map still holds the content.
+		let captured_blur =
+			|index: usize, operation: &EffectOperation| matches!(operation, EffectOperation::Blur { .. }) && !operation.changes_nothing() && capture.is_some_and(|capture| capture.index == index);
+		let operations: Vec<(usize, EffectOperation)> = (effects.operations().enumerate())
+			.filter(|(index, operation)| captured_blur(*index, operation) || !changes_nothing(operation, length_scale))
+			.collect();
 		let mut paints = paints.iter();
 		for (position, (index, operation)) in operations.iter().enumerate() {
 			let index = *index;
@@ -280,31 +301,77 @@ impl EffectPasses {
 					let radius = radius * length_scale;
 					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
 
-					// The blur gives its input back to the pool, so it takes a copy of the content rather than the content itself
-					let kernel = if box_blur { BlurKernel::Box { radius } } else { BlurKernel::Gaussian { sigma: radius } };
-					let unblurred = full.take().unwrap_or_else(|| recorder.scale(content, 1.));
-					full = Some(recorder.blur(unblurred, kernel, !gamma));
-					filled = filled.map(|filled| recorder.blur(filled, kernel, !gamma));
+					if box_blur && radius > MAX_DIRECT_BOX_RADIUS {
+						// Past the widest box blurred directly, a box sums running sums as a masked box does with every pixel at the full radius, exact rather than blurred on a halved image
+						let every_pixel = Parameters { color: [1.; 4], ..Default::default() };
+						let full_radius = recorder.run("flood", COVERAGE_FORMAT, recorder.size, content, None, None, every_pixel);
+						recorder.masked_box_blur(content, &mut full, &mut filled, &full_radius, DVec2::splat(radius), !gamma, true);
+						recorder.textures.release(full_radius);
+					} else {
+						// The blur gives its input back to the pool, so it takes a copy of the content rather than the content itself
+						let kernel = if box_blur { BlurKernel::Box { radius } } else { BlurKernel::Gaussian { sigma: radius } };
+						let unblurred = full.take().unwrap_or_else(|| recorder.scale(content, 1.));
+						full = Some(recorder.blur(unblurred, kernel, !gamma));
+						filled = filled.map(|filled| recorder.blur(filled, kernel, !gamma));
+					}
+
+					// SVG takes the results of a box blur it can't run natively as maps
+					if let Some(full) = &full {
+						capture_plane(&mut recorder, 0, full, true);
+					}
+					if let Some(filled) = &filled {
+						capture_plane(&mut recorder, 1, filled, true);
+					}
 				}
 				// A blur varying its radius by its radius mask
 				EffectOperation::Blur { radius, box_blur, gamma, .. } => {
 					let Some(map) = paints.next() else { continue };
-					if radius * length_scale < NEGLIGIBLE_LENGTH {
+					if radius * length_scale < NEGLIGIBLE_LENGTH && !captured_blur(index, operation) {
 						continue;
 					}
 					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
 
-					// The map's luminance picks each pixel's interpolation between levels, which a map gives SVG where it can't draw the radius mask as markup
-					let luminance = recorder.run("masked_radius_blur_luminance", COVERAGE_FORMAT, recorder.size, map, None, None, Parameters::default());
-					capture_plane(&mut recorder, 0, &luminance, false);
-					if capture == Some(piece(0)) && !capture_needs_content_layer {
-						recorder.textures.release(luminance);
-						break;
+					// The map's luminance picks each pixel's blur, which a map gives SVG where it can't draw the radius mask as markup.
+					// A box takes it unrounded, since SVG reads the box's result rather than its luminance.
+					let unrounded = Parameters {
+						values: [if box_blur { 1. } else { 0. }, 0., 0., 0.],
+						..Default::default()
+					};
+					let luminance = recorder.run("masked_radius_blur_luminance", COVERAGE_FORMAT, recorder.size, map, None, None, unrounded);
+					if !box_blur {
+						capture_plane(&mut recorder, 0, &luminance, false);
+						if capture == Some(piece(0)) && !capture_needs_content_layer {
+							recorder.textures.release(luminance);
+							break;
+						}
 					}
-					let levels: Vec<f64> = masked_radius_blur_levels(radius, length_scale).into_iter().map(|level| level * length_scale).collect();
-					// The content at full strength is read only by an operation after this one, or shown as the result where no fill fades it
-					let full_is_read = filled.is_none() || position + 1 < operations.len();
-					recorder.masked_radius_blur(content, &mut full, &mut filled, &luminance, &levels, box_blur, !gamma, full_is_read);
+
+					// The full-strength content is read by a later operation, as the unfaded result, or as a box blur's map, and capturing one plane ends the passes
+					let captures_only = |plane: usize| capture == Some(piece(plane)) && !capture_needs_content_layer;
+					let full_is_read = !captures_only(1) && (filled.is_none() || position + 1 < operations.len() || (box_blur && capture == Some(piece(0))));
+					match box_blur {
+						true => {
+							if captures_only(0)
+								&& let Some(filled) = filled.take()
+							{
+								recorder.textures.release(filled);
+							}
+							let radius = DVec2::splat(radius * length_scale);
+							recorder.masked_box_blur(content, &mut full, &mut filled, &luminance, radius, !gamma, full_is_read);
+
+							// SVG has no box of each pixel's own width, so it takes the results as maps
+							if let Some(full) = &full {
+								capture_plane(&mut recorder, 0, full, true);
+							}
+							if let Some(filled) = &filled {
+								capture_plane(&mut recorder, 1, filled, true);
+							}
+						}
+						false => {
+							let levels: Vec<f64> = masked_radius_blur_levels(radius, length_scale).into_iter().map(|level| level * length_scale).collect();
+							recorder.masked_radius_blur(content, &mut full, &mut filled, &luminance, &levels, !gamma, full_is_read);
+						}
+					}
 					recorder.textures.release(luminance);
 				}
 				EffectOperation::DropShadow {
@@ -631,6 +698,20 @@ impl EffectPasses {
 					recorder.fade_by(content, &mut full, &mut filled, &strength);
 					recorder.textures.release(strength);
 				}
+				EffectOperation::ConvolutionKernel { .. }
+				| EffectOperation::Emboss { .. }
+				| EffectOperation::FindEdges
+				| EffectOperation::MinimumMaximum { .. }
+				| EffectOperation::Sharpen { .. }
+				| EffectOperation::HighPass { .. }
+				| EffectOperation::AddNoise { .. }
+				| EffectOperation::Dissolve { .. } => {
+					recorder.merge_beneath(content, &mut full, &mut filled, beneath.take());
+					let captured_plane = capture.filter(|capture| capture.index == index).map(|capture| capture.plane);
+					recorder.filter(content, &mut full, &mut filled, operation, effect_to_pixels, captured_plane, &mut |recorder, plane, map| {
+						capture_plane(recorder, plane, map, true)
+					});
+				}
 				EffectOperation::Adjustment(_) => {
 					// A run of adjustments is carried out from its first row, in a pass for each standalone step and one for the steps between them
 					let is_adjustment = |position: usize| is_pixel_filter(&operations[position].1) && matches!(operations[position].1, EffectOperation::Adjustment(_));
@@ -884,35 +965,41 @@ impl EffectPasses {
 		}
 		chained.into_iter().for_each(|texture| recorder.textures.release(texture));
 
-		self.record_mipmaps(device, &mut recorder.encoder, target);
+		self.record_mipmaps(device, &mut recorder.encoder, recorder.textures, target);
 		queue.submit([recorder.encoder.finish()]);
 	}
 
 	/// Records the averaging of each of `texture`'s smaller mip levels from the one above it, like the levels of an uploaded image.
-	pub(crate) fn record_mipmaps(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) {
-		let level = |level: u32| {
-			texture.create_view(&wgpu::TextureViewDescriptor {
-				base_mip_level: level,
-				mip_level_count: Some(1),
-				..Default::default()
-			})
-		};
+	/// Each is halved into a pooled texture and copied into place, since WebGL sets the levels read for a whole texture, so none is drawn into while another is read.
+	pub(crate) fn record_mipmaps(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, textures: &mut EffectTextures, texture: &wgpu::Texture) {
+		let format = texture.format();
+		let mut above: Option<wgpu::Texture> = None;
 
 		for index in 1..texture.mip_level_count() {
 			let level_size = UVec2::new(texture.width() >> index, texture.height() >> index).max(UVec2::ONE);
-			self.record(
-				device,
-				encoder,
-				"halve",
-				texture.format(),
-				&level(index),
-				level_size,
-				&level(index - 1),
-				None,
-				None,
-				Parameters::default(),
-			);
+			let level = textures.acquire(device, level_size, format);
+
+			// The first level reads the top one through a view of every level
+			let source = above.as_ref().unwrap_or(texture).create_view(&wgpu::TextureViewDescriptor::default());
+			let target = level.create_view(&wgpu::TextureViewDescriptor::default());
+			self.record(device, encoder, "halve", format, &target, level_size, &source, None, None, Parameters::default());
+
+			let extent = wgpu::Extent3d {
+				width: level_size.x,
+				height: level_size.y,
+				depth_or_array_layers: 1,
+			};
+			let destination = wgpu::TexelCopyTextureInfo {
+				mip_level: index,
+				..texture.as_image_copy()
+			};
+			encoder.copy_texture_to_texture(level.as_image_copy(), destination, extent);
+
+			if let Some(above) = above.replace(level) {
+				textures.release(above);
+			}
 		}
+		above.into_iter().for_each(|texture| textures.release(texture));
 	}
 
 	/// Records the shader's `entry_point` into `target`, a view of `format` and `size`, reading the `source` view and optionally the `secondary` and `content` views.
@@ -1550,7 +1637,7 @@ impl PassRecorder<'_> {
 		}
 
 		let taps = kernel_taps(kernel, levels);
-		let mut tap_array = [[0.; 4]; MAX_TAPS];
+		let mut tap_array = [[0.; 4]; PARAMETER_TAPS];
 		tap_array[..taps.len()].copy_from_slice(&taps);
 		for axis in [DVec2::X, DVec2::Y] {
 			let step = axis / level_size(levels).as_dvec2();
@@ -1645,6 +1732,11 @@ mod tests {
 	}
 
 	#[test]
+	fn the_shaders_parameters_hold_as_many_taps_as_the_passes_write() {
+		assert!(include_str!("vello_effects.wgsl").contains(&format!("taps: array<vec4<f32>, {PARAMETER_TAPS}>")));
+	}
+
+	#[test]
 	fn kernels_keep_brightness_and_fit_one_pass() {
 		let kernels = [0.3, 1., 2.5, 7.9, 8., 12., 100., 4000.]
 			.into_iter()
@@ -1653,7 +1745,11 @@ mod tests {
 		for kernel in kernels {
 			let taps = kernel_taps(kernel, kernel.levels());
 
-			assert!(taps.len() <= MAX_TAPS, "{kernel:?} needs {} taps", taps.len());
+			assert!(
+				taps.len() <= 1 + 2 * raster_kernels::effect_kernels::MAX_KERNEL_REACH.div_ceil(2),
+				"{kernel:?} needs {} taps",
+				taps.len()
+			);
 			assert!((total_weight(&taps) - 1.).abs() < 1e-5, "{kernel:?} weighs {}", total_weight(&taps));
 		}
 	}
@@ -1706,7 +1802,7 @@ mod tests {
 		let apply = |textures: &mut EffectTextures, effects: &Effects| {
 			textures.drawn_passes.clear();
 			let layers = EffectLayers::plan(effects, BlendMode::Normal, 1., false);
-			let results = passes.apply(&context.device, &queue, textures, &content, effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+			let results = passes.apply(&context.device, &queue, textures, &content, effects, &layers, 1., 1., DAffine2::IDENTITY, &[], None);
 			results.into_iter().for_each(|(result, _)| textures.release(result));
 		};
 		let draw = |textures: &mut EffectTextures| {
@@ -1728,7 +1824,7 @@ mod tests {
 			textures.drawn_passes.clear();
 			let effects = Effects::from_operations(operations);
 			let layers = EffectLayers::plan(&effects, BlendMode::Normal, fill, false);
-			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, fill, 1., DMat2::IDENTITY, &[], None);
+			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, fill, 1., DAffine2::IDENTITY, &[], None);
 			results.into_iter().for_each(|(result, _)| textures.release(result));
 			textures.drawn_passes.clone()
 		};
@@ -1772,7 +1868,7 @@ mod tests {
 		let mut drawn = |layered: bool| {
 			textures.drawn_passes.clear();
 			let layers = EffectLayers::plan(&effects, BlendMode::Normal, 1., layered);
-			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+			let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DAffine2::IDENTITY, &[], None);
 			results.into_iter().for_each(|(result, _)| textures.release(result));
 			textures.drawn_passes.clone()
 		};
@@ -1794,7 +1890,7 @@ mod tests {
 		let content = textures.acquire(&context.device, UVec2::splat(16), wgpu::TextureFormat::Rgba8Unorm);
 		let queue = context.queue.lock();
 		let layers = EffectLayers::plan(&effects, BlendMode::Normal, 1., false);
-		let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DMat2::IDENTITY, &[], None);
+		let results = passes.apply(&context.device, &queue, &mut textures, &content, &effects, &layers, 1., 1., DAffine2::IDENTITY, &[], None);
 		results.into_iter().for_each(|(result, _)| textures.release(result));
 
 		let drawn = |label: &str| textures.drawn_passes.iter().filter(|&&drawn| drawn == label).count();

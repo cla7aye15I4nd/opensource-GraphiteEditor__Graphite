@@ -425,11 +425,12 @@ impl<'a> VelloSceneBuilder<'a> {
 		let layers = EffectLayers::plan(effects, blend_mode, fill, layered);
 
 		// The texture follows the viewport's axes if the effect space only turns and evenly scales, or else its own axes, scaled evenly to keep every direction's detail.
-		// A box blur, which isn't round, turns with its space only along that space's axes.
-		let has_box_blur = effects
-			.operations()
-			.any(|operation| matches!(operation, EffectOperation::Blur { box_blur: true, .. }) && !operation.changes_nothing());
-		let follows_viewport = is_similarity(effect_to_device.matrix2) && (!has_box_blur || is_axis_aligned(effect_to_device.matrix2));
+		// A box blur or a minimum or maximum, whose square neighborhoods aren't round, turns with its space only along that space's axes.
+		let has_square_kernel = effects.operations().any(|operation| {
+			let square = matches!(operation, EffectOperation::Blur { box_blur: true, .. } | EffectOperation::MinimumMaximum { .. });
+			square && !operation.changes_nothing()
+		});
+		let follows_viewport = is_similarity(effect_to_device.matrix2) && (!has_square_kernel || is_axis_aligned(effect_to_device.matrix2));
 		let (frame_to_device, lengths_to_frame) = match follows_viewport {
 			true => (DAffine2::IDENTITY, effect_to_device.matrix2),
 			false => {
@@ -440,10 +441,10 @@ impl<'a> VelloSceneBuilder<'a> {
 		let device_to_frame = frame_to_device.inverse();
 		let document_to_frame = Affine::new(device_to_frame.to_cols_array()) * self.view;
 		let length_scale = lengths_to_frame.determinant().abs().sqrt();
-		let (reach, working_reach) = (effects.reach() * length_scale, effects.working_reach() * length_scale);
+		let (reach, working_reach) = (effects.required_reach() * length_scale, effects.working_reach() * length_scale);
 
 		// The content and what its effects read past it, reaching into the viewport and rounded out to whole pixels of the frame.
-		// Past the view, what they read without painting (like a mask's feather) is kept as far as it fits without lowering the resolution.
+		// Past the view, what they read without painting or reading around each pixel (like a mask's feather) is kept as far as it fits without lowering the resolution.
 		let viewport = Rect::new(0., 0., self.width() as f64, self.height() as f64);
 		let viewport_in_frame = Affine::new(device_to_frame.to_cols_array()).transform_rect_bbox(viewport);
 		let content_bounds = bounds.map_or(viewport_in_frame, |bounds| document_to_frame.transform_rect_bbox(bounds));

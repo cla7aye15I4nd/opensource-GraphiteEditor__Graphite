@@ -4,6 +4,7 @@
 
 use crate::Graphic;
 use crate::adjustment::Adjustment;
+use crate::filters::{Convolution, NoiseDistribution};
 use crate::masks::{MaskMode, mask_feather_sigma};
 use crate::parameters::{ParameterVisitor, ReadParameters, WriteParameters};
 use core_types::ATTR_TRANSFORM;
@@ -48,6 +49,22 @@ pub enum EffectKind {
 	Mask,
 	/// Fades the content out toward its edges, reaching nothing at them.
 	Feather,
+	/// Sums each pixel's neighbors weighted by a kernel of numbers.
+	ConvolutionKernel,
+	/// Grays the content, showing its edges in relief as if lit from one side.
+	Emboss,
+	/// Outlines the content's edges in dark over white.
+	FindEdges,
+	/// Spreads each pixel's darkest or lightest neighboring colors.
+	MinimumMaximum,
+	/// Exaggerates how much each pixel differs from a blur of those around it, or only along edges, from its four neighbors.
+	Sharpen,
+	/// Keeps how much each pixel differs from a blur of those around it, around middle gray.
+	HighPass,
+	/// Scatters random offsets across the colors, fixed in place on the content.
+	AddNoise,
+	/// Shows a random scattering of the content fully opaque and hides the rest, more where it's more opaque.
+	Dissolve,
 	// The adjustments, which change each color of the content on its own, as their nodes of the same names do
 	Desaturate,
 	GammaCorrection,
@@ -68,6 +85,7 @@ pub enum EffectKind {
 	ColorBalance,
 	PhotoFilter,
 	ColorLookup,
+	Solarize,
 }
 
 impl std::fmt::Display for EffectKind {
@@ -84,6 +102,14 @@ impl std::fmt::Display for EffectKind {
 			Self::PaintOverlay => "Paint Overlay",
 			Self::Mask => "Mask",
 			Self::Feather => "Feather",
+			Self::ConvolutionKernel => "Convolution Kernel",
+			Self::Emboss => "Emboss",
+			Self::FindEdges => "Find Edges",
+			Self::MinimumMaximum => "Minimum/Maximum",
+			Self::Sharpen => "Sharpen",
+			Self::HighPass => "High Pass",
+			Self::AddNoise => "Add Noise",
+			Self::Dissolve => "Dissolve",
 			Self::Desaturate => "Desaturate",
 			Self::GammaCorrection => "Gamma Correction",
 			Self::MakeOpaque => "Make Opaque",
@@ -103,6 +129,7 @@ impl std::fmt::Display for EffectKind {
 			Self::ColorBalance => "Color Balance",
 			Self::PhotoFilter => "Photo Filter",
 			Self::ColorLookup => "Color Lookup",
+			Self::Solarize => "Solarize",
 		})
 	}
 }
@@ -131,6 +158,19 @@ pub enum GlowSource {
 	Edge,
 	/// Glows outward from the center.
 	Center,
+}
+
+/// Which extreme of the colors around each pixel a Minimum/Maximum spreads.
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, CacheHash, DynAny, node_macro::ChoiceType)]
+#[widget(Radio)]
+pub enum MinimumMaximumMode {
+	/// Spreads the darkest colors, growing the content's coverage by the radius.
+	#[default]
+	Minimum,
+	/// Spreads the lightest colors, shrinking the content's coverage by the radius.
+	Maximum,
 }
 
 /// One of the coverages an effect is drawn from, which a render can output in place of the effects' result, so an SVG can embed it as a map of what its filters can't work out.
@@ -424,6 +464,11 @@ impl Effects {
 		self.operations().map(|operation| operation.working_reach()).sum()
 	}
 
+	/// How far past the content a render of the effects must reach to draw them right (see [`EffectOperation::required_reach`]), in the effect space of a run of them.
+	pub fn required_reach(&self) -> f64 {
+		self.operations().map(|operation| operation.required_reach()).sum()
+	}
+
 	/// Splits the rows into runs stamped in the same space, in order, each with the transform its effects were stamped at.
 	/// A transform applied between two effects starts a new run, which renders around the result of those before it.
 	/// Effects that change nothing join the run they're in, and a run of only those takes the space of the next effect.
@@ -482,6 +527,12 @@ impl Effects {
 		}
 	}
 
+	/// The effects with operations that `keep` accepts, in order, each still stamped where it was.
+	pub fn keeping(&self, keep: impl Fn(&EffectOperation) -> bool) -> Self {
+		let kept = self.effects().enumerate().filter(|(_, effect)| keep(&effect.operation())).map(|(index, _)| index);
+		Effects(kept.filter_map(|index| self.0.clone_item(index)).collect())
+	}
+
 	/// How far past the content the effects together can paint along each axis of the space `content_transform` places the content in.
 	pub fn reach_along_axes(&self, content_transform: DAffine2) -> DVec2 {
 		self.reach_along_axes_by(content_transform, EffectOperation::painted_reach)
@@ -503,7 +554,7 @@ impl Effects {
 
 	/// How far past the content the effects reading around each pixel (see [`EffectOperation::reads_pixels_around`]) together read, along the axis of the space `content_transform` places the content in that they read furthest along.
 	pub fn read_reach(&self, content_transform: DAffine2) -> f64 {
-		let reach = |operation: &EffectOperation| if operation.reads_pixels_around() { operation.painted_reach() } else { 0. };
+		let reach = |operation: &EffectOperation| if operation.reads_pixels_around() { operation.working_reach() } else { 0. };
 		self.reach_along_axes_by(content_transform, reach).max_element()
 	}
 
@@ -735,7 +786,8 @@ pub fn rebased_stamped_transform(stamped_transform: DAffine2, baked: DAffine2) -
 /// An effect's parameters decoded from its row, the form that renderers carry it out from. Lengths are in its [`effect_space`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum EffectOperation {
-	/// Blurs the content after what lies beneath it joins it, evenly or by the interpolation between blurs [`crate::masks::masked_radius_blur_interpolation`] defines.
+	/// Blurs the content after what lies beneath it joins it, evenly or as its radius mask varies the radius: by the interpolation between Gaussians [`crate::masks::masked_radius_blur_interpolation`] defines,
+	/// or as a box blur, by a box at each pixel as wide as its fraction of the radius.
 	Blur {
 		/// Lies in the content's own space, so it moves with the content, with its luminance setting each point's fraction of the radius.
 		/// One that draws nothing, the default, blurs the whole content by the radius.
@@ -881,6 +933,58 @@ pub enum EffectOperation {
 		/// How far in from the edges the fade reaches full strength.
 		distance: f64,
 	},
+	ConvolutionKernel {
+		/// The weights row by row, centered on each pixel as [`Convolution::custom`] places them.
+		kernel: List<f64>,
+		/// How many weights each row of the kernel holds.
+		columns: u32,
+		/// What the weighted sum is divided by.
+		scale: f64,
+		/// On a scale of 0 to 255.
+		offset: f64,
+		/// Whether the content's coverage is weighed by the kernel too, rather than kept.
+		apply_to_alpha: bool,
+	},
+	Emboss {
+		/// The direction the light comes from, in degrees counterclockwise from the right.
+		angle: f64,
+		/// How far apart the two samples are, the difference between them showing as relief.
+		height: f64,
+		/// Percent.
+		amount: f64,
+	},
+	FindEdges,
+	MinimumMaximum {
+		/// How many pixels the square neighborhood reaches out from its center.
+		radius: f64,
+		mode: MinimumMaximumMode,
+	},
+	Sharpen {
+		/// Percent.
+		amount: f64,
+		/// The standard deviation of the Gaussian blur the content is compared against, which Edges Only ignores.
+		radius: f64,
+		/// On a scale of 0 to 255.
+		threshold: f64,
+		/// Whether the content is compared against its four nearest neighbors only along edges, as [`crate::filters::edge_gain`] ramps it, rather than against the blur.
+		edges_only: bool,
+	},
+	HighPass {
+		radius: f64,
+	},
+	AddNoise {
+		/// Percent of full brightness.
+		amount: f64,
+		distribution: NoiseDistribution,
+		/// Whether each pixel's colors all take the same offset, so only their brightness changes.
+		monochromatic: bool,
+		seed: i64,
+	},
+	Dissolve {
+		/// Percent of the content that shows where it's fully opaque.
+		opacity: f64,
+		seed: i64,
+	},
 	Adjustment(Adjustment),
 }
 
@@ -888,6 +992,21 @@ impl EffectOperation {
 	/// The operation an effect of this kind carries out when its row gives none of its parameters, matching the defaults of the node that stamps it.
 	pub fn default_for(kind: EffectKind) -> Self {
 		Effect(Item::new_from_element(kind)).operation()
+	}
+
+	/// A convolution kernel of the weights `text` writes (see [`crate::filters::parse_kernel`]), its sums divided by `scale` and raised by `offset` levels out of 255, weighing the coverage too if `apply_to_alpha`.
+	/// Without a `scale`, it divides by the [`crate::filters::automatic_scale`].
+	pub fn convolution_kernel(text: &str, scale: Option<f64>, offset: f64, apply_to_alpha: bool) -> Self {
+		let (weights, columns) = crate::filters::parse_kernel(text);
+		let scale = scale.unwrap_or_else(|| crate::filters::automatic_scale(&weights, columns));
+
+		Self::ConvolutionKernel {
+			kernel: List::new_from_elements(weights),
+			columns: columns as u32,
+			scale,
+			offset,
+			apply_to_alpha,
+		}
 	}
 
 	pub fn kind(&self) -> EffectKind {
@@ -903,7 +1022,38 @@ impl EffectOperation {
 			Self::PaintOverlay { .. } => EffectKind::PaintOverlay,
 			Self::Mask { .. } => EffectKind::Mask,
 			Self::Feather { .. } => EffectKind::Feather,
+			Self::ConvolutionKernel { .. } => EffectKind::ConvolutionKernel,
+			Self::Emboss { .. } => EffectKind::Emboss,
+			Self::FindEdges => EffectKind::FindEdges,
+			Self::MinimumMaximum { .. } => EffectKind::MinimumMaximum,
+			Self::Sharpen { .. } => EffectKind::Sharpen,
+			Self::HighPass { .. } => EffectKind::HighPass,
+			Self::AddNoise { .. } => EffectKind::AddNoise,
+			Self::Dissolve { .. } => EffectKind::Dissolve,
 			Self::Adjustment(adjustment) => adjustment.kind(),
+		}
+	}
+
+	/// The weighted sum of shifted copies of the content that a filter carries out, for the filters that are one.
+	pub fn convolution(&self) -> Option<Convolution> {
+		match self {
+			// An empty kernel, like the identity, leaves the content as it is
+			Self::ConvolutionKernel {
+				kernel,
+				columns,
+				scale,
+				offset,
+				apply_to_alpha,
+			} => {
+				let weights: Vec<f64> = kernel.iter_element_values().copied().collect();
+				let convolution = Convolution {
+					weighs_coverage: *apply_to_alpha,
+					..Convolution::custom(&weights, *columns as usize, *scale, *offset)
+				};
+				(!weights.is_empty() && !convolution.is_identity()).then_some(convolution)
+			}
+			Self::Emboss { angle, height, amount } => Some(Convolution::emboss(*angle, *height, *amount)),
+			_ => None,
 		}
 	}
 
@@ -926,7 +1076,12 @@ impl EffectOperation {
 			Self::Adjustment(Adjustment::ColorOverlay { color, opacity, .. }) => color.a() <= 0. || *opacity <= 0.,
 			Self::Mask { density, .. } => *density <= 0.,
 			Self::Feather { distance } => *distance <= 0.,
-			Self::Adjustment(_) => false,
+			Self::ConvolutionKernel { .. } => self.convolution().is_none(),
+			Self::Emboss { .. } | Self::FindEdges | Self::HighPass { .. } | Self::Dissolve { .. } | Self::Adjustment(_) => false,
+			Self::AddNoise { amount, .. } => *amount <= 0.,
+			// The four neighbors lie a fixed distance away, so only the blur needs a radius
+			Self::Sharpen { amount, radius, edges_only, .. } => *amount <= 0. || (!*edges_only && *radius <= 0.),
+			Self::MinimumMaximum { radius, .. } => *radius <= 0.,
 		}
 	}
 
@@ -939,6 +1094,7 @@ impl EffectOperation {
 	pub fn reads_pixels_around(&self) -> bool {
 		match self {
 			Self::Blur { .. } => true,
+			Self::ConvolutionKernel { .. } | Self::Emboss { .. } | Self::FindEdges | Self::MinimumMaximum { .. } | Self::Sharpen { .. } | Self::HighPass { .. } => true,
 			// Cast from the content's shape, reading a mask's own image or a feather's map, or changing each pixel alone
 			Self::DropShadow { .. }
 			| Self::InnerShadow { .. }
@@ -948,17 +1104,27 @@ impl EffectOperation {
 			| Self::Outline { .. }
 			| Self::BevelAndEmboss { .. }
 			| Self::Feather { .. } => false,
-			Self::PaintOverlay { .. } | Self::Mask { .. } | Self::Adjustment(_) => false,
+			Self::PaintOverlay { .. } | Self::Mask { .. } | Self::AddNoise { .. } | Self::Dissolve { .. } | Self::Adjustment(_) => false,
 		}
 	}
 
-	/// How far past the content this operation paints, which is nowhere for an operation that changes nothing, a mask, or a feather.
+	/// How far past the content this operation paints, which is nowhere for an operation that changes nothing, a mask, a feather, or a filter that keeps or shrinks the content's coverage.
 	pub fn painted_reach(&self) -> f64 {
-		if self.changes_nothing() || matches!(self, Self::Mask { .. } | Self::Feather { .. }) {
-			0.
-		} else {
-			self.reach()
-		}
+		let keeps_coverage = matches!(
+			self,
+			Self::Mask { .. }
+				| Self::Feather { .. }
+				| Self::ConvolutionKernel { apply_to_alpha: false, .. }
+				| Self::Emboss { .. }
+				| Self::FindEdges
+				| Self::MinimumMaximum {
+					mode: MinimumMaximumMode::Maximum,
+					..
+				}
+				| Self::Sharpen { .. }
+				| Self::HighPass { .. }
+		);
+		if self.changes_nothing() || keeps_coverage { 0. } else { self.reach() }
 	}
 
 	/// How far past the content this operation paints or reads from, which the region it's worked out over covers, and nowhere for an operation that changes nothing.
@@ -966,10 +1132,16 @@ impl EffectOperation {
 		if self.changes_nothing() { 0. } else { self.reach() }
 	}
 
+	/// How far past the content a render must reach for this operation to come out right: as far as it paints, or for one reading around each pixel, as far as it reads.
+	pub fn required_reach(&self) -> f64 {
+		if self.reads_pixels_around() { self.working_reach() } else { self.painted_reach() }
+	}
+
 	/// How far past the content this operation can paint, or reads from, in its effect space.
 	pub fn reach(&self) -> f64 {
 		match self {
-			// A Gaussian is negligible past three standard deviations
+			// A box reaches its half width, and the pixel past it for a fractional one, while a Gaussian fades out over three standard deviations
+			Self::Blur { radius, box_blur: true, .. } => radius.max(0.) + 1.,
 			Self::Blur { radius, .. } => 3. * radius.max(0.),
 			// An inner shadow paints within the content but reads this far out to find the edges it casts from.
 			// Shadows and glows end within their size, past which a precise glow fades over one more unit.
@@ -983,7 +1155,14 @@ impl EffectOperation {
 			Self::Mask { feather, .. } => 3. * mask_feather_sigma(*feather),
 			// A feather paints nothing past the content, but finds edges up to this far past it, which a render cut short there would miss
 			Self::Feather { distance } => distance.max(0.) + 1.,
-			Self::PaintOverlay { .. } | Self::Adjustment(_) => 0.,
+			Self::ConvolutionKernel { .. } | Self::Emboss { .. } => self.convolution().map_or(0., |convolution| convolution.read_reach()),
+			// The Sobel taps' diagonal, then a faint pixel's nearest visible color within the square of a pixel around that, plus two pixels for rounding and copies between pixels
+			Self::Sharpen { edges_only: true, .. } => 2. * std::f64::consts::SQRT_2 + 2.,
+			Self::Sharpen { radius, .. } | Self::HighPass { radius } => 3. * radius.max(0.) + 1.,
+			// The Sobel taps' diagonal, which a rotation can turn along an axis, plus two pixels for rounding and copies between pixels
+			Self::FindEdges => std::f64::consts::SQRT_2 + 2.,
+			Self::MinimumMaximum { radius, .. } => radius.max(0.).ceil() + 1.,
+			Self::PaintOverlay { .. } | Self::AddNoise { .. } | Self::Dissolve { .. } | Self::Adjustment(_) => 0.,
 		}
 	}
 
@@ -1062,7 +1241,12 @@ impl EffectOperation {
 			} => [depth, size, soften, angle, altitude, slope_range, texture_depth].into_iter().for_each(finite),
 			Self::Mask { density, feather, .. } => [density, feather].into_iter().for_each(finite),
 			Self::Feather { distance } => finite(distance),
-			Self::PaintOverlay { .. } | Self::Adjustment(_) => {}
+			Self::Emboss { angle, height, amount } => [angle, height, amount].into_iter().for_each(finite),
+			Self::MinimumMaximum { radius, .. } | Self::HighPass { radius } => finite(radius),
+			Self::Sharpen { amount, radius, threshold, .. } => [amount, radius, threshold].into_iter().for_each(finite),
+			Self::AddNoise { amount, .. } => finite(amount),
+			Self::Dissolve { opacity, .. } => finite(opacity),
+			Self::PaintOverlay { .. } | Self::ConvolutionKernel { .. } | Self::FindEdges | Self::Adjustment(_) => {}
 		}
 		self
 	}
@@ -1164,6 +1348,33 @@ impl EffectOperation {
 				invert: false,
 			},
 			EffectKind::Feather => Self::Feather { distance: 0. },
+			EffectKind::ConvolutionKernel => Self::ConvolutionKernel {
+				kernel: List::new(),
+				columns: 0,
+				scale: 0.,
+				offset: 0.,
+				apply_to_alpha: false,
+			},
+			EffectKind::Emboss => Self::Emboss { angle: 0., height: 0., amount: 0. },
+			EffectKind::FindEdges => Self::FindEdges,
+			EffectKind::MinimumMaximum => Self::MinimumMaximum {
+				radius: 0.,
+				mode: MinimumMaximumMode::default(),
+			},
+			EffectKind::Sharpen => Self::Sharpen {
+				amount: 0.,
+				radius: 0.,
+				threshold: 0.,
+				edges_only: false,
+			},
+			EffectKind::HighPass => Self::HighPass { radius: 0. },
+			EffectKind::AddNoise => Self::AddNoise {
+				amount: 0.,
+				distribution: NoiseDistribution::default(),
+				monochromatic: false,
+				seed: 0,
+			},
+			EffectKind::Dissolve => Self::Dissolve { opacity: 0., seed: 0 },
 			EffectKind::Desaturate => Self::Adjustment(Adjustment::Desaturate { method: Default::default() }),
 			EffectKind::GammaCorrection => Self::Adjustment(Adjustment::GammaCorrection { gamma: 0., inverse: false }),
 			EffectKind::MakeOpaque => Self::Adjustment(Adjustment::MakeOpaque),
@@ -1199,6 +1410,7 @@ impl EffectOperation {
 				preserve_luminosity: false,
 			}),
 			EffectKind::ColorLookup => Self::Adjustment(Adjustment::ColorLookup { lut_file: Default::default() }),
+			EffectKind::Solarize => Self::Adjustment(Adjustment::Solarize),
 		}
 	}
 
@@ -1371,6 +1583,57 @@ impl EffectOperation {
 				visitor.parameter("invert", invert, false);
 			}
 			Self::Feather { distance } => visitor.parameter("distance", distance, 10.),
+			Self::ConvolutionKernel {
+				kernel,
+				columns,
+				scale,
+				offset,
+				apply_to_alpha,
+			} => {
+				visitor.parameter("kernel", kernel, List::new_from_elements(vec![0., 0., 0., 0., 1., 0., 0., 0., 0.]));
+				visitor.parameter("columns", columns, 3);
+				visitor.parameter("scale", scale, 1.);
+				visitor.parameter("offset", offset, 0.);
+				visitor.parameter("apply_to_alpha", apply_to_alpha, false);
+			}
+			// For PSD interop, the defaults are those of the filters' dialogs
+			Self::Emboss { angle, height, amount } => {
+				visitor.parameter("angle", angle, 135.);
+				visitor.parameter("height", height, 3.);
+				visitor.parameter("amount", amount, 100.);
+			}
+			Self::FindEdges => {}
+			Self::MinimumMaximum { radius, mode } => {
+				visitor.parameter("radius", radius, 1.);
+				visitor.parameter("mode", mode, MinimumMaximumMode::default());
+			}
+			Self::Sharpen {
+				amount,
+				radius,
+				threshold,
+				edges_only,
+			} => {
+				visitor.parameter("amount", amount, 50.);
+				visitor.parameter("radius", radius, 1.);
+				visitor.parameter("threshold", threshold, 0.);
+				visitor.parameter("edges_only", edges_only, false);
+			}
+			Self::HighPass { radius } => visitor.parameter("radius", radius, 10.),
+			Self::AddNoise {
+				amount,
+				distribution,
+				monochromatic,
+				seed,
+			} => {
+				visitor.parameter("amount", amount, 12.5);
+				visitor.parameter("distribution", distribution, NoiseDistribution::default());
+				visitor.parameter("monochromatic", monochromatic, false);
+				visitor.parameter("seed", seed, 0);
+			}
+			Self::Dissolve { opacity, seed } => {
+				visitor.parameter("opacity", opacity, 50.);
+				visitor.parameter("seed", seed, 0);
+			}
 			Self::Adjustment(adjustment) => adjustment.visit_parameters(visitor),
 		}
 	}
@@ -1495,6 +1758,43 @@ mod tests {
 				blend_mode: BlendMode::Screen,
 				opacity: 100.,
 			}),
+			EffectOperation::convolution_kernel("-1 0 1\n-2 0 2\n-1 0 1", Some(4.), 128., false),
+			EffectOperation::convolution_kernel("0 -1 0\n-1 8 -1\n0 -1 0", None, 0., true),
+			EffectOperation::Emboss {
+				angle: -30.,
+				height: 4.5,
+				amount: 250.,
+			},
+			EffectOperation::FindEdges,
+			EffectOperation::MinimumMaximum {
+				radius: 2.5,
+				mode: MinimumMaximumMode::Minimum,
+			},
+			EffectOperation::MinimumMaximum {
+				radius: 7.,
+				mode: MinimumMaximumMode::Maximum,
+			},
+			EffectOperation::Adjustment(Adjustment::Solarize),
+			EffectOperation::Sharpen {
+				amount: 180.,
+				radius: 2.5,
+				threshold: 4.,
+				edges_only: false,
+			},
+			EffectOperation::HighPass { radius: 3.5 },
+			EffectOperation::Sharpen {
+				amount: 100.,
+				radius: 1.,
+				threshold: 0.,
+				edges_only: true,
+			},
+			EffectOperation::AddNoise {
+				amount: 40.,
+				distribution: NoiseDistribution::Gaussian,
+				monochromatic: true,
+				seed: 7,
+			},
+			EffectOperation::Dissolve { opacity: 25., seed: 3 },
 		];
 
 		for operation in operations {
@@ -1739,6 +2039,7 @@ mod tests {
 			ColorBalance,
 			PhotoFilter,
 			ColorLookup,
+			Solarize,
 			PaintOverlay,
 		];
 		for kind in kinds {
@@ -1809,6 +2110,56 @@ mod tests {
 
 		let effects = Effects::from_operations([mask]);
 		assert_eq!((effects.reach(), effects.working_reach()), (0., 3. * mask_feather_sigma(4.)));
+		// Unlike a convolution, which a render must read past the view for, the feather leaves edges past the view to what fits
+		assert_eq!(effects.required_reach(), 0.);
+	}
+
+	#[test]
+	fn a_convolution_paints_nothing_past_the_content_but_reads_past_it() {
+		let sharpen = EffectOperation::convolution_kernel("0 -1 0\n-1 5 -1\n0 -1 0", Some(1.), 0., false);
+		assert_eq!(sharpen.painted_reach(), 0.);
+
+		// Weighing the coverage too, a kernel can spread it past the content
+		let spread = EffectOperation::convolution_kernel("1 1 1", None, 0., true);
+		assert_eq!(spread.painted_reach(), spread.reach());
+
+		// Its farthest copy a pixel away, a faint pixel's nearest visible color within the square around that, turned any way, and two pixels for rounding and copies between pixels
+		let reach = 1. + std::f64::consts::SQRT_2 + 2.;
+		assert_eq!((sharpen.working_reach(), sharpen.required_reach()), (reach, reach));
+
+		// The stylize and sharpen filters keep or shrink the coverage too, while a Minimum grows it
+		let keeping = [
+			EffectOperation::Emboss {
+				angle: 135.,
+				height: 3.,
+				amount: 100.,
+			},
+			EffectOperation::FindEdges,
+			EffectOperation::MinimumMaximum {
+				radius: 3.,
+				mode: MinimumMaximumMode::Maximum,
+			},
+			EffectOperation::Sharpen {
+				amount: 100.,
+				radius: 3.,
+				threshold: 0.,
+				edges_only: false,
+			},
+			EffectOperation::HighPass { radius: 3. },
+			EffectOperation::Sharpen {
+				amount: 100.,
+				radius: 1.,
+				threshold: 0.,
+				edges_only: true,
+			},
+		];
+		assert!(keeping.iter().all(|operation| operation.painted_reach() == 0. && operation.working_reach() > 0.));
+		let minimum = EffectOperation::MinimumMaximum {
+			radius: 3.,
+			mode: MinimumMaximumMode::Minimum,
+		};
+		assert_eq!(minimum.painted_reach(), 4.);
+		assert_eq!(Effects::from_operations([sharpen]).read_reach(DAffine2::IDENTITY), reach);
 	}
 
 	#[test]

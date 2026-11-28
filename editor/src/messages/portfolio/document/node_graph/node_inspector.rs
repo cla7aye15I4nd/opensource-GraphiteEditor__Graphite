@@ -40,7 +40,7 @@ use graphene_std::vector::style::{
 	build_transform_with_y_preservation,
 };
 use graphene_std::vector::{QRCodeErrorCorrectionLevel, VectorModification};
-use graphene_std::{Artboard, BevelDirection, BevelStyle, BevelTechnique, GlowSource, GlowTechnique, Graphic, MaskMode, Vector};
+use graphene_std::{Artboard, BevelDirection, BevelStyle, BevelTechnique, GlowSource, GlowTechnique, Graphic, MaskMode, MinimumMaximumMode, NoiseDistribution, Vector};
 use graphene_std::{NodeParameter, ParameterRef};
 use math_parser::parser::{MessagePart, ParseError};
 use std::path::PathBuf;
@@ -453,9 +453,11 @@ pub(crate) fn inspector_row_from_type(node_id: NodeId, index: usize, ty: &Type, 
 				Some(x) if id_is::<GlowTechnique>(x) => enum_choice::<GlowTechnique>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<GlowSource>(x) => enum_choice::<GlowSource>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<MaskMode>(x) => enum_choice::<MaskMode>().for_socket(default_info).inspector_row(),
+				Some(x) if id_is::<MinimumMaximumMode>(x) => enum_choice::<MinimumMaximumMode>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<BevelStyle>(x) => enum_choice::<BevelStyle>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<BevelDirection>(x) => enum_choice::<BevelDirection>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<BevelTechnique>(x) => enum_choice::<BevelTechnique>().for_socket(default_info).inspector_row(),
+				Some(x) if id_is::<NoiseDistribution>(x) => enum_choice::<NoiseDistribution>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<QRCodeErrorCorrectionLevel>(x) => enum_choice::<QRCodeErrorCorrectionLevel>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<ScaleType>(x) => enum_choice::<ScaleType>().for_socket(default_info).inspector_row(),
 				Some(x) if id_is::<InterpolationDistribution>(x) => enum_choice::<InterpolationDistribution>().for_socket(default_info).inspector_row(),
@@ -3766,6 +3768,29 @@ pub fn offset_path_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 	let miter_limit = number_widget(ParameterWidgetsInfo::new(node_id, MiterLimitInput, true, context), number_input);
 
 	vec![LayoutGroup::row(distance), join, LayoutGroup::row(miter_limit)]
+}
+
+pub(crate) fn sharpen_inspector(node_id: NodeId, context: &mut NodeInspectorContext) -> Vec<LayoutGroup> {
+	use graphene_std::blending_nodes::filters::sharpen::*;
+
+	// Edges Only compares against the four nearest neighbors in place of the blur, so it doesn't read the radius
+	let edges_only = get_document_node(node_id, context)
+		.ok()
+		.and_then(|document_node| document_node.input(EdgesOnlyInput).and_then(|input| input.as_value()))
+		.is_some_and(|tagged| matches!(tagged, TaggedValue::Bool(true)));
+
+	let number_input = NumberInput::default().mode_range().unit("%").min(0.).range_max(Some(500.));
+	let amount = number_widget(ParameterWidgetsInfo::new(node_id, AmountInput, true, context), number_input);
+
+	let number_input = NumberInput::default().mode_range().unit(" px").min(0.).range_max(Some(250.)).disabled(edges_only);
+	let radius = number_widget(ParameterWidgetsInfo::new(node_id, RadiusInput, true, context), number_input);
+
+	let number_input = NumberInput::default().mode_range().min(0.).range_max(Some(255.));
+	let threshold = number_widget(ParameterWidgetsInfo::new(node_id, ThresholdInput, true, context), number_input);
+
+	let edges_only = bool_widget(ParameterWidgetsInfo::new(node_id, EdgesOnlyInput, true, context), CheckboxInput::default());
+
+	vec![LayoutGroup::row(amount), LayoutGroup::row(radius), LayoutGroup::row(threshold), LayoutGroup::row(edges_only)]
 }
 
 pub struct ParameterWidgetsInfo<'a> {

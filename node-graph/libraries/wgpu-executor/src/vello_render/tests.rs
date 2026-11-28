@@ -6,6 +6,7 @@
 use crate::WgpuExecutor;
 use core_types::blending::BlendMode;
 use glam::{DAffine2, UVec2};
+use graphic_types::MinimumMaximumMode;
 use rendering::vello_scene_builder::VelloSceneBuilder;
 use vello_gpu::kurbo::{Affine, BezPath, Line, ParamCurve, PathSeg, Point, Rect, Stroke, Vec2};
 use vello_gpu::peniko::{self, Color, Fill};
@@ -62,6 +63,11 @@ fn circle(center: (f64, f64), radius: f64) -> BezPath {
 
 fn pixel(pixels: &[[u8; 4]], size: UVec2, x: u32, y: u32) -> [u8; 4] {
 	pixels[(y * size.x + x) as usize]
+}
+
+/// A Minimum/Maximum effect of the `radius` in the `mode`.
+fn minimum_maximum(radius: f64, mode: MinimumMaximumMode) -> graphic_types::EffectOperation {
+	graphic_types::EffectOperation::MinimumMaximum { radius, mode }
 }
 
 const RED: Color = Color::from_rgb8(255, 0, 0);
@@ -760,6 +766,234 @@ fn inner_glows_satins_outlines_and_bevels_fall_where_they_should() {
 }
 
 #[test]
+fn convolution_kernels_filter_endless_gradients_and_colors() {
+	use core_types::ATTR_TRANSFORM;
+	use core_types::Color;
+	use core_types::list::{ATTR_EFFECTS, Item, List};
+	use glam::DVec2;
+	use graphic_types::vector_types::gradient::Gradient;
+	use graphic_types::{Effect, EffectOperation, Effects, Graphic, stamp_effect};
+	use rendering::{Render, RenderParams};
+
+	let size = UVec2::new(64, 16);
+	let render_graphic = |graphic: Graphic| render(size, |scene| graphic.render_to_vello(scene, DAffine2::IDENTITY, &RenderParams::default()));
+	let difference = EffectOperation::convolution_kernel("-1 0 1", Some(1.), 128., false);
+
+	// A difference across a gradient from black to white over the view finds its slope, lifted from middle gray by the offset
+	let gradient = |effects: Vec<EffectOperation>| {
+		let mut item = Item::new_from_element(Gradient::from(vec![Color::BLACK, Color::WHITE])).with_attribute(ATTR_TRANSFORM, DAffine2::from_scale(DVec2::new(64., 1.)));
+		effects.iter().for_each(|operation| stamp_effect(&mut item, Effect::new(operation)));
+		Graphic::GradientList(List::new_from_item(item))
+	};
+	let Some(plain) = render_graphic(gradient(Vec::new())) else { return };
+	let Some(filtered) = render_graphic(gradient(vec![difference.clone()])) else { return };
+	let sloped = pixel(&filtered, size, 32, 8);
+	assert!(sloped[0] > 128 && sloped[0] < 160 && sloped[0] != pixel(&plain, size, 32, 8)[0], "{sloped:?}");
+
+	// A flat color changes by its weights' sum and the offset exactly as a rectangle of it covering the view does
+	let halved_and_raised = EffectOperation::convolution_kernel("1", Some(2.), 64., false);
+	let color = |effects: Vec<EffectOperation>| {
+		Graphic::ColorList(List::new_from_item(
+			Item::new_from_element(Color::WHITE).with_attribute(ATTR_EFFECTS, Effects::from_operations(effects)),
+		))
+	};
+	let Some(flat) = render_graphic(color(vec![halved_and_raised.clone()])) else { return };
+	let Some(rectangle) = render_square_with_effects(vec![halved_and_raised], 1., -50., 178., size) else {
+		return;
+	};
+	assert_eq!(pixel(&flat, size, 32, 8), pixel(&rectangle, size, 32, 8));
+	assert_eq!(pixel(&flat, size, 32, 8), [191, 191, 191, 255]);
+}
+
+#[test]
+fn random_fields_match_the_cpu_zoomed_out_and_away_from_the_origin() {
+	use core_types::list::Item;
+	use core_types::{ATTR_TRANSFORM, Color as GraphicColor};
+	use graphic_types::raster_types::{Image, Raster};
+	use graphic_types::{Effect, EffectOperation, Graphic, NoiseDistribution, stamp_effect};
+	use raster_kernels::evaluate_raster_effects;
+	use rendering::{Render, RenderParams};
+
+	let Some(executor) = executor() else { return };
+
+	// A raster whose pixels each span two document pixels, far out on the negative side of the origin, rendered one texel per pixel, so each takes four samples
+	let (width, origin) = (32, glam::DVec2::new(-1000., -600.));
+	let placement = DAffine2::from_translation(origin) * DAffine2::from_scale(glam::DVec2::splat(2. * width as f64));
+	let view = DAffine2::from_scale(glam::DVec2::splat(0.5)) * DAffine2::from_translation(-origin);
+	let noise = |amount, distribution, monochromatic| EffectOperation::AddNoise {
+		amount,
+		distribution,
+		monochromatic,
+		seed: 11,
+	};
+	let operations = [
+		noise(40., NoiseDistribution::Uniform, false),
+		noise(20., NoiseDistribution::Gaussian, true),
+		EffectOperation::Dissolve { opacity: 60., seed: 4 },
+	];
+
+	for operation in operations {
+		let image = Image::new(width, width, GraphicColor::from_gamma_srgb_channels(0.4, 0.6, 0.5, 1.));
+		let mut item = Item::new_from_element(Raster::new_cpu(image)).with_attribute(ATTR_TRANSFORM, placement);
+		stamp_effect(&mut item, Effect::new(&operation));
+
+		let graphic = Graphic::RasterCPU(Box::new(item.clone()));
+		let gpu = {
+			let _turn = take_turn();
+			let texture = executor
+				.render_vello(UVec2::splat(width), view, &mut |scene| graphic.render_to_vello(scene, DAffine2::IDENTITY, &RenderParams::default()))
+				.expect("the render succeeds");
+			executor.read_texture_pixels(&texture).expect("the render reads back")
+		};
+
+		// Compared premultiplied, so a nearly transparent pixel's color can't dominate
+		let evaluated = evaluate_raster_effects(item);
+		let mut worst = 0;
+		for (cpu, gpu) in evaluated.element().data.iter().zip(gpu.as_chunks::<4>().0) {
+			let [red, green, blue, alpha] = cpu.to_gamma_srgb_channels();
+			let cpu = [red * alpha, green * alpha, blue * alpha, alpha].map(|channel| channel * 255.);
+			let gpu_alpha = gpu[3] as f32 / 255.;
+			for channel in 0..4 {
+				let gpu_channel = if channel == 3 { gpu[3] as f32 } else { gpu[channel] as f32 * gpu_alpha };
+				worst = worst.max((cpu[channel] - gpu_channel).abs().round() as u32);
+			}
+		}
+		assert!(worst <= 2, "{operation:?} differs from the GPU by up to {worst} levels");
+	}
+}
+
+#[test]
+fn random_fields_stay_in_place_far_from_the_origin() {
+	use core_types::list::{ATTR_EFFECTS, Item, List};
+	use glam::DVec2;
+	use graphic_types::{EffectOperation, Effects, Graphic, NoiseDistribution};
+	use rendering::{Render, RenderParams};
+
+	// Noise over an endless color whose cells lie past where 32-bit floats hold every integer, rendered there and a pixel further right
+	let size = UVec2::splat(16);
+	let noise = EffectOperation::AddNoise {
+		amount: 40.,
+		distribution: NoiseDistribution::Uniform,
+		monochromatic: false,
+		seed: 3,
+	};
+	let color = Item::new_from_element(core_types::Color::from_gamma_srgb_channels(0.5, 0.5, 0.5, 1.)).with_attribute(ATTR_EFFECTS, Effects::from_operations([noise]));
+	let graphic = Graphic::ColorList(List::new_from_item(color));
+	let render_at = |x: f64| {
+		render(size, |scene| {
+			graphic.render_to_vello(scene, DAffine2::from_translation(-DVec2::new(x, 16_777_219.)), &RenderParams::default())
+		})
+	};
+	let Some(placed) = render_at(33_554_433.) else { return };
+	let Some(moved) = render_at(33_554_434.) else { return };
+
+	// Each pixel of the second render shows the cell the next pixel of the first one does
+	for y in 0..size.y {
+		for x in 0..size.x - 1 {
+			assert_eq!(pixel(&moved, size, x, y), pixel(&placed, size, x + 1, y), "at ({x}, {y})");
+		}
+	}
+}
+
+#[test]
+fn random_fields_change_endless_colors() {
+	use core_types::list::{ATTR_EFFECTS, Item, List};
+	use graphic_types::{EffectOperation, Effects, Graphic};
+	use rendering::{Render, RenderParams};
+
+	let size = UVec2::splat(16);
+	let effects = Effects::from_operations([EffectOperation::Dissolve { opacity: 50., seed: 0 }]);
+	let color = Item::new_from_element(core_types::Color::from_gamma_srgb_channels(0.8, 0.2, 0.4, 1.)).with_attribute(ATTR_EFFECTS, effects);
+	let graphic = Graphic::ColorList(List::new_from_item(color));
+	let Some(pixels) = render(size, |scene| graphic.render_to_vello(scene, DAffine2::IDENTITY, &RenderParams::default())) else {
+		return;
+	};
+
+	let shown = pixels.iter().filter(|pixel| pixel[3] == 255).count();
+	assert!(shown > 64 && shown < 192 && pixels.iter().all(|pixel| pixel[3] == 0 || pixel[3] == 255), "{shown} of 256 shown");
+}
+
+#[test]
+fn filters_carry_out_over_endless_colors() {
+	use core_types::list::{ATTR_EFFECTS, Item, List};
+	use graphic_types::{EffectOperation, Effects, Graphic};
+	use rendering::{Render, RenderParams};
+
+	let size = UVec2::splat(16);
+	let effects = Effects::from_operations([
+		EffectOperation::Emboss {
+			angle: 135.,
+			height: 3.,
+			amount: 100.,
+		},
+		EffectOperation::FindEdges,
+	]);
+	let color = Item::new_from_element(core_types::Color::from_gamma_srgb_channels(0.8, 0.2, 0.4, 1.)).with_attribute(ATTR_EFFECTS, effects);
+	let graphic = Graphic::ColorList(List::new_from_item(color));
+	let Some(pixels) = render(size, |scene| graphic.render_to_vello(scene, DAffine2::IDENTITY, &RenderParams::default())) else {
+		return;
+	};
+	// Embossing a flat color grays it, and finding the edges of flat gray whitens it, as for a rectangle of it covering the view
+	assert_eq!(pixel(&pixels, size, 8, 8), [255, 255, 255, 255]);
+}
+
+#[test]
+fn convolution_kernels_read_colors_continuing_past_the_edges() {
+	use graphic_types::EffectOperation;
+
+	let size = UVec2::new(128, 128);
+
+	// A difference across the white square finds no edge at its silhouette, since the colors beyond it continue, so the offset leaves middle gray within it
+	let difference = EffectOperation::convolution_kernel("-1 0 1", Some(1.), 128., false);
+	let Some(pixels) = render_square_with_effects(vec![difference], 1., 30., 80., size) else { return };
+	for x in [30, 55, 79] {
+		assert_eq!(pixel(&pixels, size, x, 55), [128, 128, 128, 255], "at x = {x}");
+	}
+	assert_eq!(pixel(&pixels, size, 28, 55)[3], 0, "the coverage stays as it is");
+
+	// An empty kernel, like an identity kernel, leaves the content as it is beside other effects
+	let empty = EffectOperation::convolution_kernel("", Some(1.), 0., false);
+	let blur = EffectOperation::Blur {
+		radius_mask: Default::default(),
+		radius: 1.,
+		box_blur: false,
+		gamma: false,
+	};
+	let Some(pixels) = render_square_with_effects(vec![empty, blur], 1., 30., 80., size) else {
+		return;
+	};
+	assert_eq!(pixel(&pixels, size, 55, 55), [255; 4]);
+}
+
+#[test]
+fn stylize_filters_show_the_silhouette_and_move_its_coverage() {
+	use graphic_types::EffectOperation;
+
+	let size = UVec2::new(128, 128);
+	let render_square = |effect| render_square_with_effects(vec![effect], 1., 30., 80., size);
+
+	// Embossed with the light from the left, the flat inside is middle gray, and the edges show against the gray matted beyond them, dark on the left and light on the right
+	let emboss = EffectOperation::Emboss {
+		angle: 180.,
+		height: 2.,
+		amount: 100.,
+	};
+	let Some(pixels) = render_square(emboss) else { return };
+	let inside = pixel(&pixels, size, 55, 55);
+	assert!(inside[..3].iter().all(|channel| (127..=128).contains(channel)) && inside[3] == 255, "the flat inside is {inside:?}");
+	assert!(pixel(&pixels, size, 30, 55)[0] < 128 && pixel(&pixels, size, 79, 55)[0] > 128, "the edges in relief");
+	assert_eq!(pixel(&pixels, size, 28, 55)[3], 0, "nothing outside");
+
+	// The neighborhood maximum of the white square shrinks it, and the minimum grows it
+	let Some(pixels) = render_square(minimum_maximum(3., MinimumMaximumMode::Maximum)) else { return };
+	assert_eq!(pixel(&pixels, size, 32, 55)[3], 0, "within the radius of the edge");
+	assert_eq!(pixel(&pixels, size, 33, 55), [255; 4]);
+	let Some(pixels) = render_square(minimum_maximum(3., MinimumMaximumMode::Minimum)) else { return };
+	assert_eq!(pixel(&pixels, size, 27, 55), [255; 4], "within the radius past the edge");
+	assert_eq!(pixel(&pixels, size, 26, 55)[3], 0);
+}
+
+#[test]
 fn paint_overlays_stretch_unplaced_paints_across_the_content() {
 	use core_types::Color as GraphicColor;
 	use core_types::blending::BlendMode;
@@ -1125,6 +1359,23 @@ fn masked_radius_blurs_blur_as_much_as_their_map_is_bright() {
 			column(&pixels, x)
 		);
 	}
+
+	// As a box blur, it's exactly the box of the fraction of the radius its luminance code gives
+	let Some(gray_box) = render(masked_by(Graphic::from(gray), true)) else { return };
+	let Some(fraction_box) = render(EffectOperation::Blur {
+		radius_mask: Default::default(),
+		radius: radius * 102. / 255.,
+		box_blur: true,
+		gamma: false,
+	}) else {
+		return;
+	};
+	for x in 40..60 {
+		assert!(
+			(column(&gray_box, x) - column(&fraction_box, x)).abs() <= 1. / 255.,
+			"at {x} a gray map's box blur differs from the box of its radius"
+		);
+	}
 }
 
 #[test]
@@ -1177,6 +1428,206 @@ fn zoomed_in_masked_radius_blurs_blur_by_the_fraction_of_their_radius_without_gh
 		let alpha = pixel(&pixels, size, x, 80)[3] as f64 / 255.;
 		let expected = normal_cdf((x as f64 + 0.5 - 50.) / sigma);
 		assert!((alpha - expected).abs() < 0.03, "at {x} the zoomed blur reaches {alpha} rather than {expected}");
+	}
+}
+
+/// What the GPU's effect passes leave of `texels` (premultiplied gamma-encoded half floats, `width` to a row) carrying out `effects` with lengths one to a pixel,
+/// reading the effects' drawn paints from `paints` of the same size, unrounded.
+fn gpu_effect_texels(effects: &graphic_types::Effects, texels: &[[half::f16; 4]], width: usize, paints: &[&[[half::f16; 4]]]) -> Option<Vec<[f32; 4]>> {
+	use wgpu::util::DeviceExt;
+
+	let executor = executor()?;
+	let effect_passes = &executor.inner.vello_renderer.effect_passes;
+	if !effect_passes.renders_working_formats {
+		return None;
+	}
+	let device = &executor.context().device;
+	let _turn = take_turn();
+
+	let descriptor = wgpu::TextureDescriptor {
+		label: Some("effect_test_texels"),
+		size: wgpu::Extent3d {
+			width: width as u32,
+			height: (texels.len() / width) as u32,
+			depth_or_array_layers: 1,
+		},
+		mip_level_count: 1,
+		sample_count: 1,
+		dimension: wgpu::TextureDimension::D2,
+		format: wgpu::TextureFormat::Rgba16Float,
+		usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+		view_formats: &[],
+	};
+
+	let queue = executor.context().queue.lock();
+	let upload = |texels: &[[half::f16; 4]]| device.create_texture_with_data(&queue, &descriptor, wgpu::util::TextureDataOrder::LayerMajor, bytemuck::cast_slice(texels));
+	let content = upload(texels);
+	let paints: Vec<wgpu::Texture> = paints.iter().map(|paint| upload(paint)).collect();
+
+	let mut textures = crate::vello_effects::EffectTextures::default();
+	let layers = graphic_types::effect_layers::EffectLayers::plan(effects, BlendMode::Normal, 1., false);
+	let results = effect_passes.apply(device, &queue, &mut textures, &content, effects, &layers, 1., 1., DAffine2::IDENTITY, &paints, None);
+	let (result, _) = results.into_iter().next()?;
+	drop(queue);
+
+	let bytes = executor.read_texture_pixels(&result).ok()?;
+	let half_floats: Vec<f32> = bytes.as_chunks::<2>().0.iter().map(|&bytes| half::f16::from_le_bytes(bytes).to_f32()).collect();
+	Some(half_floats.as_chunks::<4>().0.to_vec())
+}
+
+/// A masked box blur of `radius` pixels, in gamma if `gamma`, with its map given to the passes as a paint texture.
+fn masked_box_blur(radius: f64, gamma: bool) -> graphic_types::Effects {
+	graphic_types::Effects::from_operations([graphic_types::EffectOperation::Blur {
+		radius_mask: graphic_types::Graphic::from(core_types::Color::WHITE),
+		radius,
+		box_blur: true,
+		gamma,
+	}])
+}
+
+/// The box of `half_width` along each axis around a pixel of `width` by `height` premultiplied channels, summed pixel by pixel with the edge pixels held past the edges.
+fn summed_box(channels: &[[f32; 4]], width: usize, height: usize, x: usize, y: usize, half_width: f64) -> [f64; 4] {
+	use raster_kernels::effect_kernels::box_weight;
+
+	let reach = half_width.ceil() as i64;
+	let (mut sum, mut total) = ([0.; 4], 0.);
+	for offset_y in -reach..=reach {
+		for offset_x in -reach..=reach {
+			let weight = box_weight(half_width, offset_x.unsigned_abs() as usize) * box_weight(half_width, offset_y.unsigned_abs() as usize);
+			let source_x = (x as i64 + offset_x).clamp(0, width as i64 - 1) as usize;
+			let source_y = (y as i64 + offset_y).clamp(0, height as i64 - 1) as usize;
+			let pixel = channels[source_y * width + source_x];
+
+			sum = std::array::from_fn(|channel| sum[channel] + weight * pixel[channel] as f64);
+			total += weight;
+		}
+	}
+	sum.map(|channel| channel / total)
+}
+
+#[test]
+fn gpu_masked_box_blurs_match_the_cpu() {
+	use graphic_types::masks::{MaskMode, mask_coverage};
+	use half::f16;
+	use raster_kernels::effect_kernels::Plane;
+
+	// Colorful content reaching the edges, every fifth pixel transparent and others translucent, which the CPU blurs as the GPU reads it
+	let (width, height) = (96, 72);
+	let texels: Vec<[f16; 4]> = (0..width * height)
+		.map(|index| {
+			let (x, y) = ((index % width) as f32 / width as f32, (index / width) as f32 / height as f32);
+			let alpha = [0., 0.4, 1., 1., 1.][index % 5];
+			[x * alpha, y * y * alpha, (1. - x * y) * alpha, alpha].map(f16::from_f32)
+		})
+		.collect();
+	let plane = Plane {
+		width,
+		height,
+		data: texels.iter().map(|texel| texel.map(f16::to_f32)).collect(),
+	};
+
+	// Opaque gray maps of each pixel's luminance: one gray, a ramp across, scattered values, and checks of none and all of the radius
+	type CodeAt = fn(usize, usize) -> usize;
+	let maps: [(&str, CodeAt); 4] = [
+		("gray", |_, _| 102),
+		("ramp", |x, _| x * 255 / 95),
+		("scattered", |x, y| (x * 7919 + y * 104_729) % 256),
+		("checks", |x, y| if (x / 6 + y / 6) % 2 == 0 { 0 } else { 255 }),
+	];
+	for (name, code_at) in maps {
+		let map: Vec<[f16; 4]> = (0..width * height)
+			.map(|index| {
+				let gray = code_at(index % width, index / width) as f32 / 255.;
+				[gray, gray, gray, 1.].map(f16::from_f32)
+			})
+			.collect();
+		let luminance = |texel: &[f16; 4]| mask_coverage(texel.map(f16::to_f32), MaskMode::Luminance).clamp(0., 1.);
+		let luminances: Vec<f32> = map.iter().map(|texel| f16::from_f32(luminance(texel)).to_f32()).collect();
+
+		for (radius, gamma) in [(7.3, false), (7.3, true), (16., false), (30.5, true)] {
+			let Some(gpu) = gpu_effect_texels(&masked_box_blur(radius, gamma), &texels, width, &[&map]) else {
+				return;
+			};
+			let cpu = raster_kernels::masks::variable_box_blur(&plane, &luminances, glam::DVec2::splat(radius), !gamma);
+
+			// Within the rounding of the GPU's half floats
+			let differences = gpu.iter().zip(&cpu.data).flat_map(|(gpu, cpu)| (0..4).map(|channel| (gpu[channel] - cpu[channel]).abs()));
+			let worst = differences.fold(0., f32::max) * 255.;
+			assert!(worst < 0.3, "a {name} map at {radius} pixels (gamma: {gamma}) differs from the CPU by {worst} levels");
+		}
+	}
+}
+
+#[test]
+fn gpu_box_blurs_with_a_white_radius_mask_match_those_without_at_any_radius() {
+	use half::f16;
+
+	// Colorful content blurred past the widest box the GPU runs directly, where both sum the same running sums
+	let (width, height) = (96, 72);
+	let texels: Vec<[f16; 4]> = (0..width * height)
+		.map(|index| {
+			let (x, y) = ((index % width) as f32 / width as f32, (index / width) as f32 / height as f32);
+			let alpha = [0., 0.4, 1., 1., 1.][index % 5];
+			[x * alpha, y * y * alpha, (1. - x * y) * alpha, alpha].map(f16::from_f32)
+		})
+		.collect();
+	let white = vec![[f16::ONE; 4]; width * height];
+
+	for gamma in [false, true] {
+		let plain = graphic_types::Effects::from_operations([graphic_types::EffectOperation::Blur {
+			radius_mask: Default::default(),
+			radius: 40.,
+			box_blur: true,
+			gamma,
+		}]);
+		let Some(plain) = gpu_effect_texels(&plain, &texels, width, &[]) else { return };
+		let Some(masked) = gpu_effect_texels(&masked_box_blur(40., gamma), &texels, width, &[&white]) else {
+			return;
+		};
+
+		let differences = plain.iter().zip(&masked).flat_map(|(plain, masked)| (0..4).map(|channel| (plain[channel] - masked[channel]).abs()));
+		let worst = differences.fold(0., f32::max) * 255.;
+		assert!(worst < 0.3, "a white radius mask differs from none by {worst} levels (gamma: {gamma})");
+	}
+}
+
+#[test]
+fn gpu_masked_box_blurs_stay_exact_across_large_images() {
+	use half::f16;
+
+	// Nearly white content of 8 million pixels, whose running sums reach the millions, too many for one f32 to hold to a pixel's worth
+	let (width, height) = (4096, 2048);
+	let texels: Vec<[f16; 4]> = (0..width * height)
+		.map(|index: usize| {
+			let value = 0.9 + 0.1 * (index.wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.;
+			[value, value, value, 1.].map(f16::from_f32)
+		})
+		.collect();
+	let map = vec![[f16::ONE; 4]; width * height];
+
+	for gamma in [true, false] {
+		// The opaque content's colors in the light the blur sums them in
+		let transfer = |convert: fn(f32) -> f32, [red, green, blue, alpha]: [f32; 4]| [convert(red), convert(green), convert(blue), alpha];
+		let channels: Vec<[f32; 4]> = (texels.iter().map(|texel| texel.map(f16::to_f32)))
+			.map(|channels| if gamma { channels } else { transfer(core_types::color::srgb_to_linear, channels) })
+			.collect();
+
+		let radius = 1.5;
+		let Some(gpu) = gpu_effect_texels(&masked_box_blur(radius, gamma), &texels, width, &[&map]) else {
+			return;
+		};
+
+		// The smallest boxes in the corner the sums end at, where a single f32's rounding would outweigh them, and in the corner they start at
+		let mut worst = 0_f32;
+		for y in (height - 32..height).chain(0..4) {
+			for x in (width - 32..width).chain(0..4) {
+				let summed = summed_box(&channels, width, height, x, y, radius).map(|channel| channel as f32);
+				let expected = if gamma { summed } else { transfer(core_types::color::linear_to_srgb, summed) };
+				let actual = gpu[y * width + x];
+				worst = worst.max((0..4).map(|channel| (actual[channel] - expected[channel]).abs()).fold(0., f32::max));
+			}
+		}
+		assert!(worst * 255. < 0.3, "a box blur strays {} levels from the exact box at the far corner (gamma: {gamma})", worst * 255.);
 	}
 }
 
@@ -1568,6 +2019,72 @@ fn captured_coverages_the_effects_never_reach_cover_nothing() {
 }
 
 #[test]
+fn captured_box_blurs_hold_their_results_for_svg_however_slight() {
+	use graphic_types::effects::EffectCapture;
+	use graphic_types::{EffectOperation, Effects, Graphic};
+	use rendering::Render;
+
+	let size = UVec2::new(64, 64);
+	let square = Rect::new(20., 20., 40., 40.);
+	let white = Graphic::from(core_types::Color::WHITE);
+	let mut draw_map = |_: usize, scene: &mut VelloSceneBuilder| white.render_to_vello(scene, DAffine2::IDENTITY, &rendering::RenderParams::default().for_pattern());
+	let mut render_through = |operation: EffectOperation, capture: Option<EffectCapture>| {
+		let effects = Effects::from_operations([operation]);
+		render(size, |scene| {
+			if let Some(capture) = capture {
+				scene.capture_next_effects(capture);
+			}
+			scene.draw_effects(&effects, 1., 1., BlendMode::Normal, true, Some(square), DAffine2::IDENTITY, &mut draw_map, &mut |scene| {
+				scene.fill(Fill::NonZero, Affine::IDENTITY, Color::WHITE, None, &square)
+			});
+		})
+	};
+
+	// The map SVG takes in place of a box blur, plain or with a radius mask, is the blurred content itself
+	let masked = |radius| EffectOperation::Blur {
+		radius_mask: white.clone(),
+		radius,
+		box_blur: true,
+		gamma: false,
+	};
+	for operation in [
+		EffectOperation::Blur {
+			radius_mask: Default::default(),
+			radius: 3.5,
+			box_blur: true,
+			gamma: false,
+		},
+		masked(3.5),
+	] {
+		let Some(shown) = render_through(operation.clone(), None) else { return };
+		let Some(captured) = render_through(operation.clone(), Some(EffectCapture { index: 0, plane: 0 })) else {
+			return;
+		};
+		assert!(shown.iter().any(|pixel| (1..255).contains(&pixel[3])), "{operation:?} blurs nothing");
+		for (shown, captured) in shown.iter().zip(&captured) {
+			assert!(
+				shown.iter().zip(captured).all(|(shown, captured)| shown.abs_diff(*captured) <= 1),
+				"{operation:?} captures {captured:?} where it shows {shown:?}"
+			);
+		}
+	}
+
+	// A blur too slight to run at this scale, plain or with a radius mask, still captures the content, rather than nothing
+	let slight = EffectOperation::Blur {
+		radius_mask: Default::default(),
+		radius: 0.005,
+		box_blur: true,
+		gamma: false,
+	};
+	for operation in [slight, masked(0.005)] {
+		let Some(captured) = render_through(operation.clone(), Some(EffectCapture { index: 0, plane: 0 })) else {
+			return;
+		};
+		assert_eq!(pixel(&captured, size, 30, 30)[3], 255, "{operation:?}");
+	}
+}
+
+#[test]
 fn cpu_evaluated_effects_match_the_gpu_passes() {
 	use core_types::Color as GraphicColor;
 	use core_types::blending::BlendMode;
@@ -1580,7 +2097,7 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 	use graphic_types::raster_types::{Image, Raster};
 	use graphic_types::vector_types::gradient::{Gradient, GradientForm, GradientStop};
 	use graphic_types::vector_types::vector::style::StrokeAlign;
-	use graphic_types::{BevelDirection, BevelStyle, BevelTechnique, Effect, EffectOperation, GlowSource, GlowTechnique, Graphic, MaskMode, stamp_effect};
+	use graphic_types::{BevelDirection, BevelStyle, BevelTechnique, Effect, EffectOperation, GlowSource, GlowTechnique, Graphic, MaskMode, NoiseDistribution, stamp_effect};
 	use raster_kernels::evaluate_raster_effects;
 
 	let size = UVec2::new(160, 160);
@@ -1993,6 +2510,8 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 		vec![painted(&checks), masked_radius_blur(&linear, 12., false, true)],
 		vec![painted(&checker), masked_radius_blur(&linear, 12., false, false)],
 		vec![painted(&checker), masked_radius_blur(&mask_image, 8., true, false)],
+		// Boxes of each pixel's own fractional width across hard edges, in gamma
+		vec![painted(&checks), masked_radius_blur(&resampled, 15.5, true, true)],
 	];
 
 	// Content in a color of its own, so every mode has colors to blend
@@ -2000,6 +2519,144 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 	let gpu_content = Color::from_rgb8(content[0], content[1], content[2]);
 	let [red, green, blue] = content.map(|channel| channel as f32 / 255.);
 	let cpu_content = GraphicColor::from_gamma_srgb_channels(red, green, blue, 1.);
+
+	// Filters of the checkerboard's colors, whose sharp edges the kernels pick out
+	let checkered = |filter: EffectOperation| [overlay(&checker, BlendMode::Normal, 100.), vec![filter]].concat();
+	// Kernels of rows as wide as they are tall, unless their width is given
+	let kernel_of_width = |kernel: Vec<f64>, columns: usize, scale, offset| EffectOperation::ConvolutionKernel {
+		kernel: kernel.into_iter().map(Item::new_from_element).collect(),
+		columns: columns as u32,
+		scale,
+		offset,
+		apply_to_alpha: false,
+	};
+	let convolution_kernel = |kernel: Vec<f64>, scale, offset| kernel_of_width(kernel.clone(), kernel.len().isqrt(), scale, offset);
+	let applied_to_alpha = |kernel: Vec<f64>, scale| EffectOperation::ConvolutionKernel {
+		columns: kernel.len().isqrt() as u32,
+		kernel: kernel.into_iter().map(Item::new_from_element).collect(),
+		scale,
+		offset: 0.,
+		apply_to_alpha: true,
+	};
+	let sharpen_kernel = vec![0., -1., 0., -1., 8., -1., 0., -1., 0.];
+	let sparse = (0..81).map(|index| [(0, 2.), (40, 4.), (44, -1.), (80, 1.)].into_iter().find(|&(at, _)| at == index).map_or(0., |(_, weight)| weight));
+	paint_cases.extend([
+		checkered(convolution_kernel(vec![1.; 9], 9., 0.)),
+		checkered(convolution_kernel(vec![0., -1., 0., -1., 5., -1., 0., -1., 0.], 1., 0.)),
+		checkered(convolution_kernel([vec![0.; 10], vec![-1., -1., 1., 1., 1.], vec![0.; 10]].concat(), 2., 128.)),
+		checkered(convolution_kernel(sparse.collect(), 6., 20.)),
+		checkered(convolution_kernel(vec![1.; 49], 40., -10.)),
+		// Large sums of large weights, which must stay precise through the whole sum
+		checkered(convolution_kernel((0..81).map(|index| if index == 40 { 81. } else { -1. }).collect(), 1., 0.)),
+		checkered(convolution_kernel(
+			(0..49)
+				.map(|index| {
+					if index == 24 {
+						500.
+					} else if index % 7 == 0 {
+						-40.
+					} else {
+						0.
+					}
+				})
+				.collect(),
+			220.,
+			0.,
+		)),
+		// More taps than one pass holds, carried over between passes, and colors continued from farther than one pass of shifts reaches
+		checkered(convolution_kernel(
+			(0..121)
+				.map(|index| {
+					if index == 60 {
+						61.
+					} else if index % 2 == 0 {
+						-1.
+					} else {
+						0.5
+					}
+				})
+				.collect(),
+			31.,
+			0.,
+		)),
+		checkered(convolution_kernel((0..169).map(|index| if index % 13 == 6 || index / 13 == 6 { 1. } else { 0. }).collect(), 25., 0.)),
+		// Even and uneven kernels, centered after the middle of an even count
+		checkered(convolution_kernel((0..16).map(|index| index as f64 - 7.).collect(), 8., 64.)),
+		checkered(kernel_of_width(vec![-1., 0., 2., 0., -1.], 5, 1., 40.)),
+		checkered(kernel_of_width(vec![1., 2., 1.], 1, 4., 0.)),
+		checkered(kernel_of_width(vec![1., -1., 2., -2., 3., -3.], 2, 1., 128.)),
+		// Applied to the alpha too, the coverage sharpens, softens, and spreads past the content with the colors
+		checkered(applied_to_alpha(sharpen_kernel.clone(), 4.)),
+		vec![applied_to_alpha(sharpen_kernel.clone(), 4.)],
+		vec![applied_to_alpha(vec![1.; 25], 25.)],
+		vec![blur(3., false, false), applied_to_alpha(sharpen_kernel, 4.)],
+	]);
+	let emboss = |angle, height, amount| EffectOperation::Emboss { angle, height, amount };
+	paint_cases.extend([
+		checkered(emboss(135., 3., 100.)),
+		checkered(emboss(-20., 6.5, 300.)),
+		checkered(EffectOperation::FindEdges),
+		checkered(minimum_maximum(2., MinimumMaximumMode::Minimum)),
+		checkered(minimum_maximum(1.5, MinimumMaximumMode::Maximum)),
+		checkered(EffectOperation::Adjustment(Adjustment::Solarize)),
+		// The square's silhouette shows in relief and as an edge against what it's matted over, and its coverage moves the opposite way to its colors
+		vec![emboss(60., 2., 150.)],
+		vec![EffectOperation::FindEdges],
+		vec![minimum_maximum(40., MinimumMaximumMode::Minimum)],
+		vec![minimum_maximum(3.5, MinimumMaximumMode::Maximum)],
+		// Neighborhoods widened over several passes, out past the transparency around the square, and mixed between radii either side of a power of two
+		vec![minimum_maximum(40., MinimumMaximumMode::Maximum)],
+		vec![minimum_maximum(100.5, MinimumMaximumMode::Minimum)],
+		vec![minimum_maximum(100.5, MinimumMaximumMode::Maximum)],
+		checkered(minimum_maximum(15.5, MinimumMaximumMode::Minimum)),
+		checkered(minimum_maximum(15.5, MinimumMaximumMode::Maximum)),
+		// Soft content, whose faint fringes keep their colors, and a zero radius beside another effect, which changes nothing
+		vec![blur(3., false, false), minimum_maximum(2., MinimumMaximumMode::Minimum)],
+		vec![blur(3., false, false), minimum_maximum(1.5, MinimumMaximumMode::Maximum)],
+		vec![blur(2., false, false), minimum_maximum(0., MinimumMaximumMode::Maximum)],
+	]);
+	let unsharp = |amount, radius, threshold| EffectOperation::Sharpen {
+		amount,
+		radius,
+		threshold,
+		edges_only: false,
+	};
+	let edges_only = |amount, threshold| EffectOperation::Sharpen {
+		amount,
+		radius: 0.,
+		threshold,
+		edges_only: true,
+	};
+	paint_cases.extend([
+		checkered(unsharp(150., 2., 0.)),
+		checkered(unsharp(400., 1.2, 20.)),
+		checkered(EffectOperation::HighPass { radius: 3. }),
+		checkered(edges_only(100., 0.)),
+		checkered(edges_only(250., 15.)),
+		// The coverage sharpens too, and the colors around the edges average only what's visible
+		vec![unsharp(300., 4., 0.)],
+		vec![EffectOperation::HighPass { radius: 12. }],
+		vec![edges_only(100., 0.)],
+		// Soft content, whose faint fringes ease into being compared against their own colors and whose gentle slopes Edges Only leaves, and a zero radius, which changes nothing
+		vec![blur(3., false, false), unsharp(200., 2., 0.)],
+		vec![blur(3., false, false), EffectOperation::HighPass { radius: 4. }],
+		vec![blur(2., false, false), edges_only(200., 0.)],
+		vec![blur(2., false, false), unsharp(150., 0., 0.)],
+	]);
+	let noise = |amount, distribution, monochromatic| EffectOperation::AddNoise {
+		amount,
+		distribution,
+		monochromatic,
+		seed: 5,
+	};
+	paint_cases.extend([
+		checkered(noise(30., NoiseDistribution::Uniform, false)),
+		checkered(noise(20., NoiseDistribution::Gaussian, true)),
+		checkered(EffectOperation::Dissolve { opacity: 60., seed: 2 }),
+		// Past full brightness, and with the fill fading the coverage that Dissolve thresholds
+		vec![noise(400., NoiseDistribution::Gaussian, false)],
+		vec![EffectOperation::Dissolve { opacity: 100., seed: 9 }],
+	]);
 
 	for effects in cases.into_iter().chain(paint_cases).chain(mask_cases) {
 		for fill in [1., 0.5] {
@@ -2077,13 +2734,63 @@ fn cpu_evaluated_effects_match_the_gpu_passes() {
 				Some(EffectOperation::BevelAndEmboss { texture, .. }) if !matches!(texture, Graphic::None(_)) => 6,
 				// A slope contour steeper than a straight line amplifies the rounding of the GPU's half-float heights
 				Some(EffectOperation::BevelAndEmboss { slope_contour, .. }) if !slope_contour.is_identity() => 4,
-				// A rendered map's code apart shifts the interpolation between wide levels of a blur varied by its radius mask
+				// A rendered map's code apart shifts the interpolation between wide levels of a blur varied by its radius mask, or its box's width
 				Some(operation @ EffectOperation::Blur { .. }) if operation.varies_blur_radius() => 3,
 				_ => 2,
 			};
 			assert!(worst <= tolerance, "{effects:?} at fill {fill} differs from the GPU by up to {worst} levels");
 		}
 	}
+}
+
+#[test]
+fn gpu_neighborhood_extremes_match_the_cpu_kernels() {
+	use graphic_types::Effects;
+	use half::f16;
+
+	// Gradients across and down that a window off by a texel shifts, beside random colors, opaque out to the edges but for a translucent band and a hole
+	let (width, height) = (450, 40);
+	let texels: Vec<[f16; 4]> = (0..width * height)
+		.map(|index| {
+			let (x, y) = (index % width, index / width);
+			let alpha = match (x, y) {
+				(300..306, 10..14) => 0.,
+				(0..24, _) => 0.5,
+				_ => 1.,
+			};
+			let random = (index as u32).wrapping_mul(2_654_435_761) >> 24;
+			let straight = [x as f32 / (width - 1) as f32, y as f32 / (height - 1) as f32, random as f32 / 255.];
+			let [red, green, blue] = straight.map(|channel| channel * alpha);
+			[red, green, blue, alpha].map(f16::from_f32)
+		})
+		.collect();
+	let plane = raster_kernels::effect_kernels::Plane {
+		width,
+		height,
+		data: texels.iter().map(|texel| texel.map(f16::to_f32)).collect(),
+	};
+
+	// Radii one pass reads, those doubled several times (some near powers of two), and those reaching across the texture's height or both its sides
+	let mut strays = Vec::new();
+	for radius in [1., 2.5, 8., 9., 15.5, 31.5, 40., 64.5, 100.5, 400., 1000.] {
+		for maximum in [false, true] {
+			let mode = if maximum { MinimumMaximumMode::Maximum } else { MinimumMaximumMode::Minimum };
+			let operation = minimum_maximum(radius, mode);
+			let Some(gpu) = gpu_effect_texels(&Effects::from_operations([operation.clone()]), &texels, width, &[]) else {
+				return;
+			};
+			let cpu = raster_kernels::filter_kernels::neighborhood_extreme(&plane, radius, maximum, glam::DMat2::IDENTITY);
+
+			// In 8-bit levels, well below the 0.57 that one texel shifts the gradient across
+			let levels = (gpu.iter().zip(&cpu.data))
+				.flat_map(|(gpu, cpu)| (0..4).map(|channel| (gpu[channel] - cpu[channel]).abs() * 255.))
+				.fold(0_f32, f32::max);
+			if levels > 0.25 {
+				strays.push(format!("{operation:?} strays from the CPU's kernel by {levels} levels"));
+			}
+		}
+	}
+	assert!(strays.is_empty(), "{}", strays.join("\n"));
 }
 
 /// Colors across the RGB cube, among them black, white, grays, and saturated and near-black colors, each opaque, with some also translucent or fully transparent.
@@ -2145,7 +2852,7 @@ fn gpu_adjusted_texels(run: &[graphic_types::Adjustment], texels: &[[half::f16; 
 	let effects = Effects::from_operations(run.iter().cloned().map(EffectOperation::Adjustment));
 	let mut textures = crate::vello_effects::EffectTextures::default();
 	let layers = graphic_types::effect_layers::EffectLayers::plan(&effects, core_types::blending::BlendMode::Normal, fill, false);
-	let results = effect_passes.apply(device, &queue, &mut textures, &content, &effects, &layers, fill, 1., glam::DMat2::IDENTITY, &[], None);
+	let results = effect_passes.apply(device, &queue, &mut textures, &content, &effects, &layers, fill, 1., DAffine2::IDENTITY, &[], None);
 	let (adjusted, _) = results.into_iter().next().expect("the adjustments draw one layer");
 	drop(queue);
 
@@ -2325,6 +3032,7 @@ fn gpu_tone_adjustments_match_the_cpu_kernels() {
 			},
 		),
 		("Invert", Adjustment::Invert),
+		("Solarize", Adjustment::Solarize),
 		("Make Opaque", Adjustment::MakeOpaque),
 	];
 	assert_gpu_adjustments_match_the_cpu_kernels(runs.into_iter().map(|(name, adjustment)| (name, vec![adjustment])).collect());
@@ -3597,13 +4305,22 @@ fn minified_adjusted_images_sample_their_adjusted_mipmaps() {
 	use graphic_types::Adjustment;
 	use graphic_types::raster_types::{Image, Raster};
 
-	// White inverted to black, drawn at an eighth of its size where only the smaller levels are sampled
-	let white = Raster::new_cpu(Image::new(64, 64, core_types::Color::WHITE));
-	let draw = |scene: &mut VelloSceneBuilder| scene.draw_raster(white.clone(), vec![Adjustment::Invert], peniko::ImageSampler::new(), Affine::scale(1. / 8.));
+	// Quarters of red, green, blue, and white, inverted and drawn at an eighth of their size where only the smaller levels are sampled, each staying in its quarter
+	let quarters = [core_types::Color::RED, core_types::Color::GREEN, core_types::Color::BLUE, core_types::Color::WHITE];
+	let quarter = |x: u32, y: u32, size: u32| (x * 2 / size + 2 * (y * 2 / size)) as usize;
+	let data = (0..64 * 64).map(|index| quarters[quarter(index % 64, index / 64, 64)]).collect();
+	let image = Raster::new_cpu(Image { width: 64, height: 64, data });
+	let draw = |scene: &mut VelloSceneBuilder| scene.draw_raster(image.clone(), vec![Adjustment::Invert], peniko::ImageSampler::new(), Affine::scale(1. / 8.));
 
-	let Some(pixels) = render(UVec2::new(8, 8), draw) else { return };
-	for (index, pixel) in pixels.iter().enumerate() {
-		assert!(pixel[0] <= 1 && pixel[3] == 255, "pixel {index} is {pixel:?} rather than black");
+	let inverted = [[0, 255, 255, 255], [255, 0, 255, 255], [255, 255, 0, 255], [0, 0, 0, 255]];
+	let size = UVec2::new(8, 8);
+	let Some(pixels) = render(size, draw) else { return };
+	for y in 0..size.y {
+		for x in 0..size.x {
+			let (actual, expected) = (pixel(&pixels, size, x, y), inverted[quarter(x, y, size.x)]);
+			let close = (0..4).all(|channel| actual[channel].abs_diff(expected[channel]) <= 1);
+			assert!(close, "pixel ({x}, {y}) is {actual:?} rather than {expected:?}");
+		}
 	}
 }
 
